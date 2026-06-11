@@ -1,0 +1,13 @@
+{
+  "output": {
+    "filePath": "repomix-output.xml"
+  },
+  "ignore": {
+    "customPatterns": [
+      "icons/**",
+      "gen/**",
+      "**/*.svg",
+      ".env"
+    ]
+  }
+}
