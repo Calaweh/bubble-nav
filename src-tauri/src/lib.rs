@@ -35,16 +35,6 @@ fn get_wsl_distro_and_unix_path(path: &str) -> (String, String) {
     (distro, clean_path)
 }
 
-// Determines the safest directory format to pass to wsl.exe --cd.
-// Uses standard Windows paths for local drives to bypass cmd.exe switch-parsing bugs.
-fn get_wsl_cd_path(path: &str) -> String {
-    if path.starts_with(r"\\wsl.localhost\") || path.starts_with(r"\\wsl$\") {
-        let (_, unix_path) = get_wsl_distro_and_unix_path(path);
-        unix_path
-    } else {
-        path.to_string()
-    }
-}
 
 // Converts a Windows local path to a WSL network share path so Windows native IDEs can open it directly
 fn get_wsl_network_path(path: &str) -> String {
