@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -11,10 +10,6 @@ struct FileItem {
     name: String,
     path: String,
     is_dir: bool,
-}
-
-fn env_config(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
 fn get_wsl_distro_and_unix_path(path: &str) -> (String, String) {
@@ -32,12 +27,24 @@ fn get_wsl_distro_and_unix_path(path: &str) -> (String, String) {
     if let Some((drive, rest)) = clean_path.split_once(':') {
         let drive_letter = drive.to_lowercase();
         let unix_path = format!("/mnt/{}{}", drive_letter, rest);
-        return (env_config("WSL_DISTRO", "Ubuntu"), unix_path);
+        return ("Ubuntu".to_string(), unix_path);
     }
 
-    (env_config("WSL_DISTRO", "Ubuntu"), clean_path)
+    ("Ubuntu".to_string(), clean_path)
 }
 
+// Determines the safest directory format to pass to wsl.exe --cd.
+// Uses standard Windows paths for local drives to bypass cmd.exe switch-parsing bugs.
+fn get_wsl_cd_path(path: &str) -> String {
+    if path.starts_with(r"\\wsl.localhost\") || path.starts_with(r"\\wsl$\") {
+        let (_, unix_path) = get_wsl_distro_and_unix_path(path);
+        unix_path
+    } else {
+        path.to_string()
+    }
+}
+
+// Converts a Windows local path to a WSL network share path so Windows native IDEs can open it directly
 fn get_wsl_network_path(path: &str) -> String {
     if path.starts_with(r"\\wsl.localhost\") || path.starts_with(r"\\wsl$\") {
         return path.to_string();
@@ -46,11 +53,7 @@ fn get_wsl_network_path(path: &str) -> String {
     let clean_path = path.replace('\\', "/");
     if let Some((drive, rest)) = clean_path.split_once(':') {
         let drive_letter = drive.to_lowercase();
-        return format!(
-            r"\\wsl.localhost\Ubuntu\mnt\{}{}",
-            drive_letter,
-            rest.replace('/', "\\")
-        );
+        return format!(r"\\wsl.localhost\Ubuntu\mnt\{}{}", drive_letter, rest.replace('/', "\\"));
     }
 
     path.to_string()
@@ -124,8 +127,6 @@ fn open_cmd(app: tauri::AppHandle, path: String) -> Result<(), String> {
 
 #[tauri::command]
 fn open_vscode(app: tauri::AppHandle, path: String) -> Result<(), String> {
-    let vscode_bin = env_config("VSCODE_BIN", "code");
-
     if path.starts_with(r"\\wsl.localhost\") || path.starts_with(r"\\wsl$\") {
         let clean_path = path
             .replace(r"\\wsl.localhost\", "")
@@ -136,7 +137,7 @@ fn open_vscode(app: tauri::AppHandle, path: String) -> Result<(), String> {
             let uri = format!("vscode-remote://wsl+{}{}", distro, unix_path);
 
             Command::new("cmd.exe")
-                .args(&["/C", &vscode_bin, "--folder-uri", &uri])
+                .args(&["/C", "code", "--folder-uri", &uri])
                 .spawn()
                 .map_err(|e| e.to_string())?;
             hide_window(&app);
@@ -145,7 +146,7 @@ fn open_vscode(app: tauri::AppHandle, path: String) -> Result<(), String> {
     }
 
     Command::new("cmd.exe")
-        .args(&["/C", &vscode_bin, &format!("\"{}\"", path)])
+        .args(&["/C", "code", &format!("\"{}\"", path)])
         .spawn()
         .map_err(|e| e.to_string())?;
     hide_window(&app);
@@ -156,17 +157,58 @@ fn open_vscode(app: tauri::AppHandle, path: String) -> Result<(), String> {
 fn open_wsl_opencode(app: tauri::AppHandle, path: String, prompt: String) -> Result<(), String> {
     let (distro, unix_path) = get_wsl_distro_and_unix_path(&path);
 
-    let command_payload = format!(
-        "if command -v zsh >/dev/null; then exec zsh -l -i -c 'opencode {}; exec zsh'; else exec bash -l -i -c 'opencode {}; exec bash'; fi",
-        prompt, prompt
+    let shell_cmd = format!(
+        "cd '{}' && $HOME/.opencode/bin/opencode",
+        unix_path.replace('\'', "'\\''")
     );
 
-    Command::new("cmd.exe")
+    let wt_result = Command::new("wt.exe")
         .args(&[
-            "/C", "start", "wsl.exe", "-d", &distro, "--cd", &unix_path, "-e", "sh", "-c", &command_payload,
+            "new-tab", "--",
+            "wsl.exe", "-d", &distro,
+            "--", "bash", "-c", &shell_cmd,
         ])
-        .spawn()
-        .map_err(|e| e.to_string())?;
+        .spawn();
+
+    if wt_result.is_err() {
+        Command::new("cmd.exe")
+            .args(&[
+                "/C", "start", "OpenCode",
+                "wsl.exe", "-d", &distro,
+                "--", "bash", "-c", &shell_cmd,
+            ])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    if !prompt.is_empty() {
+        let clean_prompt = prompt
+            .replace('{', "{{}}")
+            .replace('}', "{}}")
+            .replace('(', "{(}")
+            .replace(')', "{)}")
+            .replace('+', "{+}")
+            .replace('^', "{^}")
+            .replace('%', "{%}")
+            .replace('~', "{~}")
+            .replace('[', "{[}")
+            .replace(']', "{]}");
+
+        // "OpenCode" matches the exact tab title shown in Windows Terminal
+        let ps_script = format!(
+            "$wshell = New-Object -ComObject wscript.shell; \
+             Start-Sleep -Milliseconds 3000; \
+             [void] $wshell.AppActivate('OpenCode'); \
+             Start-Sleep -Milliseconds 500; \
+             $wshell.SendKeys('{}~');",
+            clean_prompt
+        );
+
+        Command::new("powershell.exe")
+            .args(&["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps_script])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
 
     hide_window(&app);
     Ok(())
@@ -179,13 +221,6 @@ fn launch_editor(
     env: String,
     path: String,
 ) -> Result<(), String> {
-    let antigravity_path = env_config("ANTIGRAVITY_PATH", r"D:\Program Files\Antigravity IDE\Antigravity IDE.exe");
-    let visualstudio_path = env_config(
-        "VISUALSTUDIO_PATH",
-        r"C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\devenv.exe",
-    );
-    let vscode_bin = env_config("VSCODE_BIN", "code");
-
     if env == "wsl" {
         let (distro, unix_path) = get_wsl_distro_and_unix_path(&path);
 
@@ -193,19 +228,22 @@ fn launch_editor(
             "vscode" => {
                 let uri = format!("vscode-remote://wsl+{}{}", distro, unix_path);
                 Command::new("cmd.exe")
-                    .args(&["/C", &vscode_bin, "--folder-uri", &uri])
+                    .args(&["/C", "code", "--folder-uri", &uri])
                     .spawn()
                     .map_err(|e| e.to_string())?;
             }
             "antigravity" => {
-                Command::new(&antigravity_path)
+                let binary_path = r"D:\Program Files\Antigravity IDE\Antigravity IDE.exe";
+                Command::new(binary_path)
                     .args(&["--remote", &format!("wsl+{}", distro), &unix_path])
                     .spawn()
                     .map_err(|e| e.to_string())?;
             }
             "visualstudio" => {
+                let binary_path =
+                    r"C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\devenv.exe";
                 let wsl_net_path = get_wsl_network_path(&path);
-                Command::new(&visualstudio_path)
+                Command::new(binary_path)
                     .arg(&wsl_net_path)
                     .spawn()
                     .map_err(|e| e.to_string())?;
@@ -216,18 +254,21 @@ fn launch_editor(
         match editor.as_str() {
             "vscode" => {
                 Command::new("cmd.exe")
-                    .args(&["/C", &vscode_bin, &format!("\"{}\"", path)])
+                    .args(&["/C", "code", &format!("\"{}\"", path)])
                     .spawn()
                     .map_err(|e| e.to_string())?;
             }
             "antigravity" => {
-                Command::new(&antigravity_path)
+                let binary_path = r"D:\Program Files\Antigravity IDE\Antigravity IDE.exe";
+                Command::new(binary_path)
                     .arg(&path)
                     .spawn()
                     .map_err(|e| e.to_string())?;
             }
             "visualstudio" => {
-                Command::new(&visualstudio_path)
+                let binary_path =
+                    r"C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\devenv.exe";
+                Command::new(binary_path)
                     .arg(&path)
                     .spawn()
                     .map_err(|e| e.to_string())?;
@@ -242,11 +283,10 @@ fn launch_editor(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    dotenvy::dotenv().ok();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
         .setup(|app| {
             let shortcut =
                 Shortcut::new(Some(Modifiers::ALT), Code::Space);
