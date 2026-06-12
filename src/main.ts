@@ -60,6 +60,10 @@ let hoveredNodeIndex: number | null = null;
 let visibleNodes: RenderNode[] = [];
 let animatedNodes: AnimatedNode[] = [];
 
+// New retention features
+let justExitedPath: string | null = null;
+let justExitedAngle: number | null = null;
+
 function getActiveTargetPath(): string {
   return selectedFile ? selectedFile.path : currentPath;
 }
@@ -203,7 +207,9 @@ window.addEventListener("DOMContentLoaded", () => {
       originY,
       expansionPos,
       pathHistory,
-      itemsList
+      itemsList,
+      justExitedPath,
+      justExitedAngle
     );
     const nodesMoving = syncAnimatedNodes(dt);
 
@@ -263,10 +269,8 @@ window.addEventListener("DOMContentLoaded", () => {
     canvas.style.cursor = hoveredNodeIndex !== null ? "pointer" : "default";
     if (prev !== hoveredNodeIndex) startAnimation();
 
-    // Prevent any gesture updates while directory loading is active
     if (isLoadingDir) return;
 
-    // Handle Drag / Touch while holding mouse button down
     if (isHolding) {
       const dx = e.clientX - mouseDownX;
       const dy = e.clientY - mouseDownY;
@@ -274,7 +278,6 @@ window.addEventListener("DOMContentLoaded", () => {
         draggedAway = true;
       }
 
-      // ONLY allow touching and going inside satellites after dragging away from the center bubble
       if (draggedAway && hoveredNodeIndex !== null && expansionPos > 0.8) {
         const hoveredAnim = animatedNodes[hoveredNodeIndex];
         const hoveredNode = visibleNodes.find((n, idx) => nodeKey(n, idx) === hoveredAnim.key);
@@ -287,8 +290,11 @@ window.addEventListener("DOMContentLoaded", () => {
             const clamped = clampCoordinates(hoveredNode.worldX, hoveredNode.worldY);
             originX = clamped.x;
             originY = clamped.y;
+
+            // Clear exited path indicators since we navigated down
+            justExitedPath = null;
+            justExitedAngle = null;
             
-            // Anchor drag reference directly on the new center coordinate
             draggedAway = false;
             mouseDownX  = originX;
             mouseDownY  = originY;
@@ -303,11 +309,20 @@ window.addEventListener("DOMContentLoaded", () => {
 
           // 2) cd .. Back Button Hovered -> Move up a folder level
           if (hoveredNode.isBack) {
+            // Pre-calculate retention metrics relative to the current center
+            const bdx = hoveredNode.worldX - originX;
+            const bdy = hoveredNode.worldY - originY;
+            const ang = Math.atan2(bdy, bdx);
+
+            justExitedPath = currentPath;
+            justExitedAngle = ang + Math.PI;
+
             const ps = pathHistory.pop();
             if (ps) {
               currentPath = ps.path;
-              originX = ps.x;
-              originY = ps.y;
+              const clamped = clampCoordinates(hoveredNode.worldX, hoveredNode.worldY);
+              originX = clamped.x;
+              originY = clamped.y;
             } else {
               const parent = getParentPath(currentPath);
               if (parent) {
@@ -320,7 +335,6 @@ window.addEventListener("DOMContentLoaded", () => {
               originY = clamped.y;
             }
 
-            // Anchor drag reference directly on the new center coordinate
             draggedAway = false;
             mouseDownX  = originX;
             mouseDownY  = originY;
@@ -333,7 +347,7 @@ window.addEventListener("DOMContentLoaded", () => {
             return;
           }
 
-          // 3) File Hovered -> Switch instantly to showing tools for this file
+          // 3) File Hovered
           if (!hoveredNode.isDir && !hoveredNode.isAction && hoveredNode.path && (!selectedFile || selectedFile.path !== hoveredNode.path)) {
             pathHistory.push({ path: currentPath, x: originX, y: originY });
             selectedFile = itemsList.find(i => i.path === hoveredNode.path) || null;
@@ -341,7 +355,6 @@ window.addEventListener("DOMContentLoaded", () => {
             originX = clamped.x;
             originY = clamped.y;
             
-            // Anchor drag reference directly on the new center coordinate
             draggedAway = false;
             mouseDownX  = originX;
             mouseDownY  = originY;
@@ -353,15 +366,13 @@ window.addEventListener("DOMContentLoaded", () => {
             return;
           }
 
-          // 4) Touch to trigger Sub-menu / Escape actions seamlessly while holding
+          // 4) Sub-menu Action Hovered
           if (hoveredNode.isAction && hoveredNode.actionId) {
             const action = hoveredNode.actionId;
 
-            // Instantly transition to sub-editors choice menu (e.g. VS Code, VS)
             if (action.startsWith("select_") && (!selectedEditor || selectedEditor !== action.replace("select_", ""))) {
               selectedEditor = action.replace("select_", "");
               
-              // Anchor drag reference directly on the new center coordinate
               draggedAway = false;
               mouseDownX  = originX;
               mouseDownY  = originY;
@@ -373,11 +384,9 @@ window.addEventListener("DOMContentLoaded", () => {
               return;
             }
 
-            // Slide back from selection level back to tools view
             if (action === "cancel_editor" && selectedEditor) {
               selectedEditor = null;
               
-              // Anchor drag reference directly on the new center coordinate
               draggedAway = false;
               mouseDownX  = originX;
               mouseDownY  = originY;
@@ -389,7 +398,6 @@ window.addEventListener("DOMContentLoaded", () => {
               return;
             }
 
-            // Slide back from Tools back to the Folder directory view
             if (action === "back") {
               if (selectedFile) {
                 const ps = pathHistory.pop();
@@ -398,7 +406,6 @@ window.addEventListener("DOMContentLoaded", () => {
               }
               showFolderTools = false;
               
-              // Anchor drag reference directly on the new center coordinate
               draggedAway = false;
               mouseDownX  = originX;
               mouseDownY  = originY;
@@ -430,7 +437,9 @@ window.addEventListener("DOMContentLoaded", () => {
     selectedFile    = null;
     showFolderTools = false;
     selectedEditor  = null;
-    targetExpansion = 1; // Always open when reset to center
+    justExitedPath  = null;
+    justExitedAngle = null;
+    targetExpansion = 1;
     expansionPos    = 0;
     await loadCurrentDirectory();
   }
@@ -448,7 +457,7 @@ window.addEventListener("DOMContentLoaded", () => {
   });
 
   canvas.addEventListener("mousedown", async (e) => {
-    if (isLoadingDir) return; // Prevent any interaction while active directory is fetching
+    if (isLoadingDir) return;
 
     currentMouseX = e.clientX;
     currentMouseY = e.clientY;
@@ -457,7 +466,6 @@ window.addEventListener("DOMContentLoaded", () => {
     const clickedAnim   = clickedIndex !== null ? animatedNodes[clickedIndex] : null;
     const isCenterClick = clickedAnim?.key === "center";
 
-    // Setup drag tracking state
     isHolding   = true;
     draggedAway = false;
     mouseDownX  = e.clientX;
@@ -465,44 +473,42 @@ window.addEventListener("DOMContentLoaded", () => {
 
     if (expansionPos < 0.85) {
       if (isCenterClick) {
-        // Tap down to begin hold/reveal on the folder
         selectedFile    = null;
         showFolderTools = false;
         selectedEditor  = null;
         triggerOpen();
       } else {
-        // Pressed outside center while collapsed -> hide overlay
         isHolding = false;
         await hideWindow();
       }
       return;
     }
 
-    // Clicked completely off-bubble empty space -> keeps open (no action)
     if (clickedIndex === null) {
       isHolding = false;
       return;
     }
 
-    // If already open and clicked directly on a satellite node (discrete click shortcut)
     if (clickedAnim && !isCenterClick) {
       const clickedNode = visibleNodes.find((n, idx) => nodeKey(n, idx) === clickedAnim.key) ?? null;
       if (clickedNode) {
-        // If clicking on an action bubble, let isHolding remain true so mouseup triggers the event
         if (clickedNode.isAction) {
           isHolding = true;
           return;
         }
 
-        // Disable hold behaviors on file/directory clicks so quick release behaves normally
         isHolding = false;
 
+        // Navigate Down on Direct Click
         if (clickedNode.isDir && clickedNode.path && currentPath !== clickedNode.path && !clickedNode.isBack) {
           pathHistory.push({ path: currentPath, x: originX, y: originY });
           currentPath = clickedNode.path;
           const clamped = clampCoordinates(clickedNode.worldX, clickedNode.worldY);
           originX = clamped.x;
           originY = clamped.y;
+
+          justExitedPath = null;
+          justExitedAngle = null;
           
           draggedAway = false;
           mouseDownX  = originX;
@@ -516,12 +522,21 @@ window.addEventListener("DOMContentLoaded", () => {
           return;
         }
 
+        // Navigate Up on Direct Click
         if (clickedNode.isBack) {
+          const bdx = clickedNode.worldX - originX;
+          const bdy = clickedNode.worldY - originY;
+          const ang = Math.atan2(bdy, bdx);
+
+          justExitedPath = currentPath;
+          justExitedAngle = ang + Math.PI;
+
           const ps = pathHistory.pop();
           if (ps) {
             currentPath = ps.path;
-            originX = ps.x;
-            originY = ps.y;
+            const clamped = clampCoordinates(clickedNode.worldX, clickedNode.worldY);
+            originX = clamped.x;
+            originY = clamped.y;
           } else {
             const parent = getParentPath(currentPath);
             if (parent) {
@@ -571,13 +586,13 @@ window.addEventListener("DOMContentLoaded", () => {
     if (!isHolding) return;
     isHolding = false;
 
-    if (isLoadingDir) return; // Ignore releases during fetching
+    if (isLoadingDir) return;
 
     const releasedIndex = getNodeAtPosition(currentMouseX, currentMouseY, animatedNodes);
     const releasedAnim  = releasedIndex !== null ? animatedNodes[releasedIndex] : null;
     const isCenterRelease = releasedAnim?.key === "center";
 
-    // ── Click/Tap on Center bubble (no drag occurred) ───────────────────────────
+    // Center Click Release (Navigate Upwards Shortcut)
     if (isCenterRelease && !draggedAway) {
       if (selectedEditor) {
         selectedEditor = null;
@@ -603,36 +618,64 @@ window.addEventListener("DOMContentLoaded", () => {
         return;
       }
 
-      // Try navigating back through navigation history
       const ps = pathHistory.pop();
       if (ps) {
+        const backNode = animatedNodes.find(n => n.isBack);
+        if (backNode) {
+          const dx = backNode.curX - originX;
+          const dy = backNode.curY - originY;
+          const ang = Math.atan2(dy, dx);
+
+          justExitedPath = currentPath;
+          justExitedAngle = ang + Math.PI;
+
+          const clamped = clampCoordinates(backNode.curX, backNode.curY);
+          originX = clamped.x;
+          originY = clamped.y;
+        } else {
+          justExitedPath = currentPath;
+          justExitedAngle = Math.PI / 2;
+          originX = ps.x;
+          originY = ps.y;
+        }
         currentPath = ps.path;
-        originX = ps.x;
-        originY = ps.y;
         expansionPos = 0;
         targetExpansion = 1;
         startAnimation();
         await loadCurrentDirectory();
       } else {
-        // Fallback parent folder resolution
         const parent = getParentPath(currentPath);
         if (parent) {
+          const backNode = animatedNodes.find(n => n.isBack);
+          if (backNode) {
+            const dx = backNode.curX - originX;
+            const dy = backNode.curY - originY;
+            const ang = Math.atan2(dy, dx);
+
+            justExitedPath = currentPath;
+            justExitedAngle = ang + Math.PI;
+
+            const clamped = clampCoordinates(backNode.curX, backNode.curY);
+            originX = clamped.x;
+            originY = clamped.y;
+          } else {
+            justExitedPath = currentPath;
+            justExitedAngle = Math.PI / 2;
+            originX = window.innerWidth / 2;
+            originY = window.innerHeight / 2;
+          }
           currentPath = parent;
-          originX = window.innerWidth / 2;
-          originY = window.innerHeight / 2;
           expansionPos = 0;
           targetExpansion = 1;
           startAnimation();
           await loadCurrentDirectory();
         } else {
-          // Already at absolute system root: just refresh listings to keep open
           startAnimation();
         }
       }
       return;
     }
 
-    // ── Normal Drag Action / Release Trigger ─────────────────────────────────────
     if (hoveredNodeIndex !== null && expansionPos > 0.8) {
       const hoveredAnim = animatedNodes[hoveredNodeIndex];
       const hoveredNode = visibleNodes.find((n, idx) => nodeKey(n, idx) === hoveredAnim.key);
@@ -698,7 +741,6 @@ window.addEventListener("DOMContentLoaded", () => {
       }
     }
 
-    // Unhold / Release: triggers direct directory tools if no active child was chosen
     if (!selectedFile && !selectedEditor && !showFolderTools) {
       if (draggedAway || hoveredNodeIndex === null || animatedNodes[hoveredNodeIndex]?.key !== "center") {
         showFolderTools = true;
@@ -709,11 +751,9 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  // ── Boot ─────────────────────────────────────────────────────────────────────
-
   loadCurrentDirectory().then(() => {
     startAnimation();
   });
 
-  enable().catch(() => { /* Autostart enabled or unavailable */ });
+  enable().catch(() => {});
 });
