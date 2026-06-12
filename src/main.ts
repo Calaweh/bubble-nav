@@ -315,8 +315,9 @@ window.addEventListener("DOMContentLoaded", () => {
               } else {
                 currentPath = START_PATH;
               }
-              originX = window.innerWidth / 2;
-              originY = window.innerHeight / 2;
+              const clamped = clampCoordinates(hoveredNode.worldX, hoveredNode.worldY);
+              originX = clamped.x;
+              originY = clamped.y;
             }
 
             // Anchor drag reference directly on the new center coordinate
@@ -528,8 +529,9 @@ window.addEventListener("DOMContentLoaded", () => {
             } else {
               currentPath = START_PATH;
             }
-            originX = window.innerWidth / 2;
-            originY = window.innerHeight / 2;
+            const clamped = clampCoordinates(clickedNode.worldX, clickedNode.worldY);
+            originX = clamped.x;
+            originY = clamped.y;
           }
 
           draggedAway = false;
