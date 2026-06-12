@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -23,14 +24,15 @@ fn get_wsl_distro_and_unix_path(path: &str) -> (String, String) {
         }
     }
 
+    let distro = env::var("WSL_DISTRO").unwrap_or_else(|_| "Ubuntu".to_string());
     let clean_path = path.replace('\\', "/");
     if let Some((drive, rest)) = clean_path.split_once(':') {
         let drive_letter = drive.to_lowercase();
         let unix_path = format!("/mnt/{}{}", drive_letter, rest);
-        return ("Ubuntu".to_string(), unix_path);
+        return (distro, unix_path);
     }
 
-    ("Ubuntu".to_string(), clean_path)
+    (distro, clean_path)
 }
 
 // Determines the safest directory format to pass to wsl.exe --cd.
@@ -50,10 +52,11 @@ fn get_wsl_network_path(path: &str) -> String {
         return path.to_string();
     }
 
+    let distro = env::var("WSL_DISTRO").unwrap_or_else(|_| "Ubuntu".to_string());
     let clean_path = path.replace('\\', "/");
     if let Some((drive, rest)) = clean_path.split_once(':') {
         let drive_letter = drive.to_lowercase();
-        return format!(r"\\wsl.localhost\Ubuntu\mnt\{}{}", drive_letter, rest.replace('/', "\\"));
+        return format!(r"\\wsl.localhost\{}\mnt\{}{}", distro, drive_letter, rest.replace('/', "\\"));
     }
 
     path.to_string()
@@ -127,6 +130,7 @@ fn open_cmd(app: tauri::AppHandle, path: String) -> Result<(), String> {
 
 #[tauri::command]
 fn open_vscode(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let vscode_bin = env::var("VSCODE_BIN").unwrap_or_else(|_| "code".to_string());
     if path.starts_with(r"\\wsl.localhost\") || path.starts_with(r"\\wsl$\") {
         let clean_path = path
             .replace(r"\\wsl.localhost\", "")
@@ -137,7 +141,7 @@ fn open_vscode(app: tauri::AppHandle, path: String) -> Result<(), String> {
             let uri = format!("vscode-remote://wsl+{}{}", distro, unix_path);
 
             Command::new("cmd.exe")
-                .args(&["/C", "code", "--folder-uri", &uri])
+                .args(&["/C", &vscode_bin, "--folder-uri", &uri])
                 .spawn()
                 .map_err(|e| e.to_string())?;
             hide_window(&app);
@@ -146,7 +150,7 @@ fn open_vscode(app: tauri::AppHandle, path: String) -> Result<(), String> {
     }
 
     Command::new("cmd.exe")
-        .args(&["/C", "code", &format!("\"{}\"", path)])
+        .args(&["/C", &vscode_bin, &format!("\"{}\"", path)])
         .spawn()
         .map_err(|e| e.to_string())?;
     hide_window(&app);
@@ -156,10 +160,12 @@ fn open_vscode(app: tauri::AppHandle, path: String) -> Result<(), String> {
 #[tauri::command]
 fn open_wsl_opencode(app: tauri::AppHandle, path: String, prompt: String) -> Result<(), String> {
     let (distro, unix_path) = get_wsl_distro_and_unix_path(&path);
+    let opencode_bin = env::var("OPENCODE_BIN").unwrap_or_else(|_| "$HOME/.opencode/bin/opencode".to_string());
 
     let shell_cmd = format!(
-        "cd '{}' && $HOME/.opencode/bin/opencode",
-        unix_path.replace('\'', "'\\''")
+        "cd '{}' && {}",
+        unix_path.replace('\'', "'\\''"),
+        opencode_bin
     );
 
     let wt_result = Command::new("wt.exe")
@@ -221,6 +227,10 @@ fn launch_editor(
     env: String,
     path: String,
 ) -> Result<(), String> {
+    let vscode_bin = env::var("VSCODE_BIN").unwrap_or_else(|_| "code".to_string());
+    let antigravity_bin = env::var("ANTIGRAVITY_PATH").unwrap_or_default();
+    let visualstudio_bin = env::var("VISUALSTUDIO_PATH").unwrap_or_default();
+
     if env == "wsl" {
         let (distro, unix_path) = get_wsl_distro_and_unix_path(&path);
 
@@ -228,22 +238,19 @@ fn launch_editor(
             "vscode" => {
                 let uri = format!("vscode-remote://wsl+{}{}", distro, unix_path);
                 Command::new("cmd.exe")
-                    .args(&["/C", "code", "--folder-uri", &uri])
+                    .args(&["/C", &vscode_bin, "--folder-uri", &uri])
                     .spawn()
                     .map_err(|e| e.to_string())?;
             }
             "antigravity" => {
-                let binary_path = r"D:\Program Files\Antigravity IDE\Antigravity IDE.exe";
-                Command::new(binary_path)
+                Command::new(&antigravity_bin)
                     .args(&["--remote", &format!("wsl+{}", distro), &unix_path])
                     .spawn()
                     .map_err(|e| e.to_string())?;
             }
             "visualstudio" => {
-                let binary_path =
-                    r"C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\devenv.exe";
                 let wsl_net_path = get_wsl_network_path(&path);
-                Command::new(binary_path)
+                Command::new(&visualstudio_bin)
                     .arg(&wsl_net_path)
                     .spawn()
                     .map_err(|e| e.to_string())?;
@@ -254,21 +261,18 @@ fn launch_editor(
         match editor.as_str() {
             "vscode" => {
                 Command::new("cmd.exe")
-                    .args(&["/C", "code", &format!("\"{}\"", path)])
+                    .args(&["/C", &vscode_bin, &format!("\"{}\"", path)])
                     .spawn()
                     .map_err(|e| e.to_string())?;
             }
             "antigravity" => {
-                let binary_path = r"D:\Program Files\Antigravity IDE\Antigravity IDE.exe";
-                Command::new(binary_path)
+                Command::new(&antigravity_bin)
                     .arg(&path)
                     .spawn()
                     .map_err(|e| e.to_string())?;
             }
             "visualstudio" => {
-                let binary_path =
-                    r"C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\devenv.exe";
-                Command::new(binary_path)
+                Command::new(&visualstudio_bin)
                     .arg(&path)
                     .spawn()
                     .map_err(|e| e.to_string())?;
@@ -283,6 +287,7 @@ fn launch_editor(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    dotenvy::dotenv().ok();
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
