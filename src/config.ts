@@ -1,4 +1,4 @@
-export const START_PATH = import.meta.env.VITE_START_PATH || "C:\\";
+export const START_PATH = import.meta.env.VITE_START_PATH || "D:\\Projects";
 
 export const EXPAND_RATE   = 0.28;
 export const COLLAPSE_RATE = 0.32;

@@ -1,3 +1,5 @@
+mod stats;
+
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -275,6 +277,43 @@ fn launch_editor(
     Ok(())
 }
 
+#[tauri::command]
+fn record_navigate(path: String, name: String, is_dir: bool, state: tauri::State<'_, stats::StatsDb>) -> Result<(), String> {
+    state.record_navigate(&path, &name, is_dir)
+}
+
+#[tauri::command]
+fn record_pass_through(path: String, name: String, state: tauri::State<'_, stats::StatsDb>) -> Result<(), String> {
+    state.record_pass_through(&path, &name)
+}
+
+#[tauri::command]
+fn record_select(path: String, name: String, is_dir: bool, state: tauri::State<'_, stats::StatsDb>) -> Result<(), String> {
+    state.record_select(&path, &name, is_dir)
+}
+
+#[tauri::command]
+fn record_tool(
+    tool_name: String,
+    editor_name: Option<String>,
+    env: Option<String>,
+    path: String,
+    name: String,
+    state: tauri::State<'_, stats::StatsDb>,
+) -> Result<(), String> {
+    state.record_tool(&tool_name, editor_name.as_deref(), env.as_deref(), &path, &name)
+}
+
+#[tauri::command]
+fn get_frequent_nodes(limit: i64, state: tauri::State<'_, stats::StatsDb>) -> Result<Vec<stats::NodeStat>, String> {
+    state.get_frequent_nodes(limit)
+}
+
+#[tauri::command]
+fn get_frequent_tools(limit: i64, state: tauri::State<'_, stats::StatsDb>) -> Result<Vec<stats::ToolStat>, String> {
+    state.get_frequent_tools(limit)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     dotenvy::dotenv().ok();
@@ -301,6 +340,13 @@ pub fn run() {
                 }
             })?;
 
+            if let Ok(app_data_dir) = app.path().app_data_dir() {
+                let db_path = app_data_dir.join("stats.db");
+                if let Ok(s) = stats::StatsDb::new(db_path) {
+                    app.manage(s);
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -309,7 +355,13 @@ pub fn run() {
             open_cmd,
             open_vscode,
             open_wsl_opencode,
-            launch_editor
+            launch_editor,
+            record_navigate,
+            record_pass_through,
+            record_select,
+            record_tool,
+            get_frequent_nodes,
+            get_frequent_tools
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

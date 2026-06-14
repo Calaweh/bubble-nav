@@ -36,21 +36,18 @@ let originX = window.innerWidth / 2;
 let originY = window.innerHeight / 2;
 
 let expansionPos    = 0;
-let targetExpansion = 1; // Always expanded by default
+let targetExpansion = 1;
 
 let lastFrameTime = 0;
 let isAnimating = false;
 
-// Hold-to-navigate state
 let isHolding   = false;
 let draggedAway = false;
 let mouseDownX  = 0;
 let mouseDownY  = 0;
 
-// Async loading lock to prevent thread lag
 let isLoadingDir = false;
 
-// Cursor tracking for holding tether line
 let currentMouseX = window.innerWidth / 2;
 let currentMouseY = window.innerHeight / 2;
 
@@ -60,13 +57,14 @@ let hoveredNodeIndex: number | null = null;
 let visibleNodes: RenderNode[] = [];
 let animatedNodes: AnimatedNode[] = [];
 
-// New retention features
 let justExitedPath: string | null = null;
-let justExitedAngle: number | null = null;
+let justExitedX: number | null = null;
+let justExitedY: number | null = null;
 
 function getActiveTargetPath(): string {
   return selectedFile ? selectedFile.path : currentPath;
 }
+
 
 function syncAnimatedNodes(dt: number): boolean {
   let moving = false;
@@ -120,6 +118,7 @@ function syncAnimatedNodes(dt: number): boolean {
 
   animatedNodes = animatedNodes.filter((a) => {
     if (usedKeys.has(a.key)) return true;
+    if (a.baseColor === "#f1c40f" && a.path !== justExitedPath) return false;
     const newX = lerpSnap(a.curX,      originX, NODE_EXIT_RATE, dt, POS_SNAP);
     const newY = lerpSnap(a.curY,      originY, NODE_EXIT_RATE, dt, POS_SNAP);
     const newR = lerpSnap(a.curRadius, 0,       NODE_EXIT_RATE, dt, RAD_SNAP);
@@ -209,11 +208,11 @@ window.addEventListener("DOMContentLoaded", () => {
       pathHistory,
       itemsList,
       justExitedPath,
-      justExitedAngle
+      justExitedX,
+      justExitedY
     );
     const nodesMoving = syncAnimatedNodes(dt);
 
-    // Draw active connections
     const centerNode = animatedNodes.find(a => a.key === "center");
     animatedNodes.forEach((node) => {
       if (node.key === "center" || !centerNode) return;
@@ -223,7 +222,6 @@ window.addEventListener("DOMContentLoaded", () => {
       drawConnection(ctx!, centerNode.curX, centerNode.curY, node.curX, node.curY, node.curAlpha, isHov);
     });
 
-    // Draw bubbles + labels
     animatedNodes.forEach((node) => {
       const isCenter = node.key === "center";
       const isHov    = hoveredNodeIndex !== null
@@ -234,7 +232,6 @@ window.addEventListener("DOMContentLoaded", () => {
       drawLabel(ctx!, node.label, node.curX, node.curY, node.curRadius, alpha, isCenter);
     });
 
-    // Draw active tether on top — from bubble edge toward mouse cursor
     if (isHolding) {
       const cn = animatedNodes.find(a => a.key === "center");
       if (cn) {
@@ -260,6 +257,58 @@ window.addEventListener("DOMContentLoaded", () => {
     requestAnimationFrame(draw);
   }
 
+  // ── helpers shared by mousedown and mousemove back-navigation ──────────────
+
+  function doNavigateDown(node: RenderNode & { path: string }, label: string) {
+    const animNode = animatedNodes.find(a => a.path === node.path);
+    const absX = animNode ? animNode.curX : node.worldX;
+    const absY = animNode ? animNode.curY : node.worldY;
+    // Store as offset relative to current origin, so on the way back we can
+    // reconstruct the exact same screen position regardless of where originX/Y ends up.
+    const exitX = absX - originX;
+    const exitY = absY - originY;
+
+    pathHistory.push({ path: currentPath, x: originX, y: originY, exitX, exitY });
+    currentPath = node.path;
+    invoke("record_navigate", { path: currentPath, name: label, isDir: true }).catch(() => {});
+    const clamped = clampCoordinates(node.worldX, node.worldY);
+    originX = clamped.x;
+    originY = clamped.y;
+    justExitedPath = null;
+    justExitedX    = null;
+    justExitedY    = null;
+  }
+
+  function doNavigateBack(backNodeWorldX: number, backNodeWorldY: number, poppedState?: HistoryState | null) {
+    invoke("record_pass_through", { path: currentPath, name: visibleNodes[0]?.label || "" }).catch(() => {});
+
+    // If poppedState is provided, use it instead of popping pathHistory.
+    const ps = poppedState !== undefined ? poppedState : pathHistory.pop();
+    const clamped = clampCoordinates(backNodeWorldX, backNodeWorldY);
+
+    // Capture the current origin before it changes — this is the absolute screen
+    // position of the folder we are leaving, which is exactly where it appeared
+    // as a satellite in the parent view.
+    const oldOriginX = originX;
+    const oldOriginY = originY;
+
+    originX = clamped.x;
+    originY = clamped.y;
+
+    justExitedPath = currentPath;
+    justExitedX = oldOriginX;
+    justExitedY = oldOriginY;
+
+    if (ps) {
+      currentPath = ps.path;
+    } else {
+      const parent = getParentPath(currentPath);
+      currentPath = parent ?? START_PATH;
+    }
+  }
+
+  // ── mousemove ─────────────────────────────────────────────────────────────
+
   canvas.addEventListener("mousemove", async (e) => {
     currentMouseX = e.clientX;
     currentMouseY = e.clientY;
@@ -274,130 +323,63 @@ window.addEventListener("DOMContentLoaded", () => {
     if (isHolding) {
       const dx = e.clientX - mouseDownX;
       const dy = e.clientY - mouseDownY;
-      if (dx * dx + dy * dy > 25 * 25) {
-        draggedAway = true;
-      }
+      if (dx * dx + dy * dy > 25 * 25) draggedAway = true;
 
       if (draggedAway && hoveredNodeIndex !== null && expansionPos > 0.8) {
         const hoveredAnim = animatedNodes[hoveredNodeIndex];
         const hoveredNode = visibleNodes.find((n, idx) => nodeKey(n, idx) === hoveredAnim.key);
 
         if (hoveredNode && hoveredAnim.key !== "center") {
-          // 1) Folder Hovered -> Continue deep into the folder
+
+          // 1) Navigate down into folder
           if (hoveredNode.isDir && hoveredNode.path && currentPath !== hoveredNode.path && !hoveredNode.isBack) {
-            pathHistory.push({ path: currentPath, x: originX, y: originY });
-            currentPath = hoveredNode.path;
-            const clamped = clampCoordinates(hoveredNode.worldX, hoveredNode.worldY);
-            originX = clamped.x;
-            originY = clamped.y;
-
-            // Clear exited path indicators since we navigated down
-            justExitedPath = null;
-            justExitedAngle = null;
-            
-            draggedAway = false;
-            mouseDownX  = originX;
-            mouseDownY  = originY;
-
-            hoveredNodeIndex = null;
-            expansionPos = 0;
-            targetExpansion = 1;
+            doNavigateDown(hoveredNode as RenderNode & { path: string }, hoveredNode.label);
+            draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+            hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
             startAnimation();
             await loadCurrentDirectory();
             return;
           }
 
-          // 2) cd .. Back Button Hovered -> Move up a folder level
+          // 2) cd .. back
           if (hoveredNode.isBack) {
-            // Pre-calculate retention metrics relative to the current center
-            const bdx = hoveredNode.worldX - originX;
-            const bdy = hoveredNode.worldY - originY;
-            const ang = Math.atan2(bdy, bdx);
-
-            justExitedPath = currentPath;
-            justExitedAngle = ang + Math.PI;
-
-            const ps = pathHistory.pop();
-            if (ps) {
-              currentPath = ps.path;
-              const clamped = clampCoordinates(hoveredNode.worldX, hoveredNode.worldY);
-              originX = clamped.x;
-              originY = clamped.y;
-            } else {
-              const parent = getParentPath(currentPath);
-              if (parent) {
-                currentPath = parent;
-              } else {
-                currentPath = START_PATH;
-              }
-              const clamped = clampCoordinates(hoveredNode.worldX, hoveredNode.worldY);
-              originX = clamped.x;
-              originY = clamped.y;
-            }
-
-            draggedAway = false;
-            mouseDownX  = originX;
-            mouseDownY  = originY;
-
-            hoveredNodeIndex = null;
-            expansionPos = 0;
-            targetExpansion = 1;
+            doNavigateBack(hoveredNode.worldX, hoveredNode.worldY);
+            draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+            hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
             startAnimation();
             await loadCurrentDirectory();
             return;
           }
 
-          // 3) File Hovered
+          // 3) File selected
           if (!hoveredNode.isDir && !hoveredNode.isAction && hoveredNode.path && (!selectedFile || selectedFile.path !== hoveredNode.path)) {
             pathHistory.push({ path: currentPath, x: originX, y: originY });
             selectedFile = itemsList.find(i => i.path === hoveredNode.path) || null;
+            invoke("record_select", { path: hoveredNode.path, name: hoveredNode.label, isDir: false }).catch(() => {});
             const clamped = clampCoordinates(hoveredNode.worldX, hoveredNode.worldY);
-            originX = clamped.x;
-            originY = clamped.y;
-            
-            draggedAway = false;
-            mouseDownX  = originX;
-            mouseDownY  = originY;
-
-            hoveredNodeIndex = null;
-            expansionPos = 0;
-            targetExpansion = 1;
+            originX = clamped.x; originY = clamped.y;
+            draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+            hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
             startAnimation();
             return;
           }
 
-          // 4) Sub-menu Action Hovered
+          // 4) Action sub-menu
           if (hoveredNode.isAction && hoveredNode.actionId) {
             const action = hoveredNode.actionId;
 
             if (action.startsWith("select_") && (!selectedEditor || selectedEditor !== action.replace("select_", ""))) {
               selectedEditor = action.replace("select_", "");
-              
-              draggedAway = false;
-              mouseDownX  = originX;
-              mouseDownY  = originY;
-
-              hoveredNodeIndex = null;
-              expansionPos = 0;
-              targetExpansion = 1;
-              startAnimation();
-              return;
+              draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+              hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
+              startAnimation(); return;
             }
-
             if (action === "cancel_editor" && selectedEditor) {
               selectedEditor = null;
-              
-              draggedAway = false;
-              mouseDownX  = originX;
-              mouseDownY  = originY;
-
-              hoveredNodeIndex = null;
-              expansionPos = 0;
-              targetExpansion = 1;
-              startAnimation();
-              return;
+              draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+              hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
+              startAnimation(); return;
             }
-
             if (action === "back") {
               if (selectedFile) {
                 const ps = pathHistory.pop();
@@ -405,16 +387,9 @@ window.addEventListener("DOMContentLoaded", () => {
                 selectedFile = null;
               }
               showFolderTools = false;
-              
-              draggedAway = false;
-              mouseDownX  = originX;
-              mouseDownY  = originY;
-
-              hoveredNodeIndex = null;
-              expansionPos = 0;
-              targetExpansion = 1;
-              startAnimation();
-              return;
+              draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+              hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
+              startAnimation(); return;
             }
           }
         }
@@ -423,59 +398,32 @@ window.addEventListener("DOMContentLoaded", () => {
   });
 
   canvas.addEventListener("mouseleave", () => {
-    if (hoveredNodeIndex !== null) {
-      hoveredNodeIndex = null;
-      startAnimation();
-    }
+    if (hoveredNodeIndex !== null) { hoveredNodeIndex = null; startAnimation(); }
   });
 
-  async function resetToCenter() {
-    currentPath     = START_PATH;
-    originX         = window.innerWidth  / 2;
-    originY         = window.innerHeight / 2;
-    pathHistory     = [];
-    selectedFile    = null;
-    showFolderTools = false;
-    selectedEditor  = null;
-    justExitedPath  = null;
-    justExitedAngle = null;
-    targetExpansion = 1;
-    expansionPos    = 0;
-    await loadCurrentDirectory();
-  }
-
-  async function hideWindow() {
-    await getCurrentWindow().hide();
-  }
+  async function hideWindow() { await getCurrentWindow().hide(); }
 
   const appWindow = getCurrentWindow();
   appWindow.onFocusChanged(({ payload: focused }) => {
-    if (focused) {
-      targetExpansion = 1;
-      startAnimation();
-    }
+    if (focused) { targetExpansion = 1; startAnimation(); }
   });
+
+  // ── mousedown ─────────────────────────────────────────────────────────────
 
   canvas.addEventListener("mousedown", async (e) => {
     if (isLoadingDir) return;
-
-    currentMouseX = e.clientX;
-    currentMouseY = e.clientY;
+    currentMouseX = e.clientX; currentMouseY = e.clientY;
 
     const clickedIndex  = getNodeAtPosition(e.clientX, e.clientY, animatedNodes);
     const clickedAnim   = clickedIndex !== null ? animatedNodes[clickedIndex] : null;
     const isCenterClick = clickedAnim?.key === "center";
 
-    isHolding   = true;
-    draggedAway = false;
-    mouseDownX  = e.clientX;
-    mouseDownY  = e.clientY;
+    isHolding = true; draggedAway = false;
+    mouseDownX = e.clientX; mouseDownY = e.clientY;
 
     if (expansionPos < 0.85) {
       if (isCenterClick) {
-        selectedFile    = null;
-        showFolderTools = false;
-        selectedEditor  = null;
+        selectedFile = null; showFolderTools = false; selectedEditor = null;
         triggerOpen();
       } else {
         isHolding = false;
@@ -484,189 +432,91 @@ window.addEventListener("DOMContentLoaded", () => {
       return;
     }
 
-    if (clickedIndex === null) {
-      isHolding = false;
-      return;
-    }
+    if (clickedIndex === null) { isHolding = false; return; }
 
     if (clickedAnim && !isCenterClick) {
       const clickedNode = visibleNodes.find((n, idx) => nodeKey(n, idx) === clickedAnim.key) ?? null;
       if (clickedNode) {
-        if (clickedNode.isAction) {
-          isHolding = true;
-          return;
-        }
-
+        if (clickedNode.isAction) { isHolding = true; return; }
         isHolding = false;
 
-        // Navigate Down on Direct Click
+        // Click: navigate down
         if (clickedNode.isDir && clickedNode.path && currentPath !== clickedNode.path && !clickedNode.isBack) {
-          pathHistory.push({ path: currentPath, x: originX, y: originY });
-          currentPath = clickedNode.path;
-          const clamped = clampCoordinates(clickedNode.worldX, clickedNode.worldY);
-          originX = clamped.x;
-          originY = clamped.y;
-
-          justExitedPath = null;
-          justExitedAngle = null;
-          
-          draggedAway = false;
-          mouseDownX  = originX;
-          mouseDownY  = originY;
-
-          hoveredNodeIndex = null;
-          expansionPos = 0;
-          targetExpansion = 1;
+          doNavigateDown(clickedNode as RenderNode & { path: string }, clickedNode.label);
+          draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+          hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
           startAnimation();
           await loadCurrentDirectory();
           return;
         }
 
-        // Navigate Up on Direct Click
+        // Click: navigate up
         if (clickedNode.isBack) {
-          const bdx = clickedNode.worldX - originX;
-          const bdy = clickedNode.worldY - originY;
-          const ang = Math.atan2(bdy, bdx);
-
-          justExitedPath = currentPath;
-          justExitedAngle = ang + Math.PI;
-
-          const ps = pathHistory.pop();
-          if (ps) {
-            currentPath = ps.path;
-            const clamped = clampCoordinates(clickedNode.worldX, clickedNode.worldY);
-            originX = clamped.x;
-            originY = clamped.y;
-          } else {
-            const parent = getParentPath(currentPath);
-            if (parent) {
-              currentPath = parent;
-            } else {
-              currentPath = START_PATH;
-            }
-            const clamped = clampCoordinates(clickedNode.worldX, clickedNode.worldY);
-            originX = clamped.x;
-            originY = clamped.y;
-          }
-
-          draggedAway = false;
-          mouseDownX  = originX;
-          mouseDownY  = originY;
-
-          hoveredNodeIndex = null;
-          expansionPos = 0;
-          targetExpansion = 1;
+          doNavigateBack(clickedNode.worldX, clickedNode.worldY);
+          draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+          hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
           startAnimation();
           await loadCurrentDirectory();
           return;
         }
 
+        // Click: select file
         if (!clickedNode.isDir && !clickedNode.isAction && clickedNode.path) {
           pathHistory.push({ path: currentPath, x: originX, y: originY });
           selectedFile = itemsList.find(i => i.path === clickedNode.path) || null;
+          invoke("record_select", { path: clickedNode.path, name: clickedNode.label, isDir: false }).catch(() => {});
           const clamped = clampCoordinates(clickedNode.worldX, clickedNode.worldY);
-          originX = clamped.x;
-          originY = clamped.y;
-          
-          draggedAway = false;
-          mouseDownX  = originX;
-          mouseDownY  = originY;
-
-          hoveredNodeIndex = null;
-          expansionPos = 0;
-          targetExpansion = 1;
-          startAnimation();
-          return;
+          originX = clamped.x; originY = clamped.y;
+          draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+          hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
+          startAnimation(); return;
         }
       }
     }
   });
 
+  // ── mouseup ───────────────────────────────────────────────────────────────
+
   canvas.addEventListener("mouseup", async () => {
     if (!isHolding) return;
     isHolding = false;
-
     if (isLoadingDir) return;
 
-    const releasedIndex = getNodeAtPosition(currentMouseX, currentMouseY, animatedNodes);
-    const releasedAnim  = releasedIndex !== null ? animatedNodes[releasedIndex] : null;
+    const releasedIndex   = getNodeAtPosition(currentMouseX, currentMouseY, animatedNodes);
+    const releasedAnim    = releasedIndex !== null ? animatedNodes[releasedIndex] : null;
     const isCenterRelease = releasedAnim?.key === "center";
 
-    // Center Click Release (Navigate Upwards Shortcut)
+    // Center click: navigate up shortcut
     if (isCenterRelease && !draggedAway) {
       if (selectedEditor) {
-        selectedEditor = null;
-        expansionPos = 0;
-        targetExpansion = 1;
-        startAnimation();
-        return;
+        selectedEditor = null; expansionPos = 0; targetExpansion = 1; startAnimation(); return;
       }
       if (selectedFile) {
         const ps = pathHistory.pop();
         if (ps) { currentPath = ps.path; originX = ps.x; originY = ps.y; }
-        selectedFile = null;
-        expansionPos = 0;
-        targetExpansion = 1;
-        startAnimation();
-        return;
+        selectedFile = null; expansionPos = 0; targetExpansion = 1; startAnimation(); return;
       }
       if (showFolderTools) {
-        showFolderTools = false;
-        expansionPos = 0;
-        targetExpansion = 1;
-        startAnimation();
-        return;
+        showFolderTools = false; expansionPos = 0; targetExpansion = 1; startAnimation(); return;
       }
 
       const ps = pathHistory.pop();
       if (ps) {
-        const backNode = animatedNodes.find(n => n.isBack);
-        if (backNode) {
-          const dx = backNode.curX - originX;
-          const dy = backNode.curY - originY;
-          const ang = Math.atan2(dy, dx);
-
-          justExitedPath = currentPath;
-          justExitedAngle = ang + Math.PI;
-
-          const clamped = clampCoordinates(backNode.curX, backNode.curY);
-          originX = clamped.x;
-          originY = clamped.y;
-        } else {
-          justExitedPath = currentPath;
-          justExitedAngle = Math.PI / 2;
-          originX = ps.x;
-          originY = ps.y;
-        }
-        currentPath = ps.path;
-        expansionPos = 0;
-        targetExpansion = 1;
+        const backNode = visibleNodes.find(n => n.isBack);
+        const backWorldX = backNode ? backNode.worldX : ps.x;
+        const backWorldY = backNode ? backNode.worldY : ps.y;
+        doNavigateBack(backWorldX, backWorldY, ps);
+        expansionPos = 0; targetExpansion = 1;
         startAnimation();
         await loadCurrentDirectory();
       } else {
         const parent = getParentPath(currentPath);
         if (parent) {
-          const backNode = animatedNodes.find(n => n.isBack);
-          if (backNode) {
-            const dx = backNode.curX - originX;
-            const dy = backNode.curY - originY;
-            const ang = Math.atan2(dy, dx);
-
-            justExitedPath = currentPath;
-            justExitedAngle = ang + Math.PI;
-
-            const clamped = clampCoordinates(backNode.curX, backNode.curY);
-            originX = clamped.x;
-            originY = clamped.y;
-          } else {
-            justExitedPath = currentPath;
-            justExitedAngle = Math.PI / 2;
-            originX = window.innerWidth / 2;
-            originY = window.innerHeight / 2;
-          }
-          currentPath = parent;
-          expansionPos = 0;
-          targetExpansion = 1;
+          const backNode = visibleNodes.find(n => n.isBack);
+          const backWorldX = backNode ? backNode.worldX : window.innerWidth / 2;
+          const backWorldY = backNode ? backNode.worldY : window.innerHeight / 2;
+          doNavigateBack(backWorldX, backWorldY, null);
+          expansionPos = 0; targetExpansion = 1;
           startAnimation();
           await loadCurrentDirectory();
         } else {
@@ -681,60 +531,58 @@ window.addEventListener("DOMContentLoaded", () => {
       const hoveredNode = visibleNodes.find((n, idx) => nodeKey(n, idx) === hoveredAnim.key);
 
       if (hoveredNode && hoveredNode.isAction && hoveredNode.actionId) {
-        const action = hoveredNode.actionId;
+        const action  = hoveredNode.actionId;
+        const curName = currentPath.split(/[\\/]/).pop() || currentPath;
 
         if (selectedEditor) {
           if (action === "cancel_editor") {
-            selectedEditor = null;
-            expansionPos = 0; targetExpansion = 1; startAnimation();
+            selectedEditor = null; expansionPos = 0; targetExpansion = 1; startAnimation();
           } else if (action === "launch_window") {
+            invoke("record_tool", { toolName: selectedEditor, editorName: selectedEditor, env: "window", path: getActiveTargetPath(), name: curName }).catch(() => {});
             await invoke("launch_editor", { editor: selectedEditor, env: "window", path: getActiveTargetPath() });
-            await resetToCenter();
+            await hideWindow();
           } else if (action === "launch_wsl") {
-            await invoke("launch_editor", { editor: selectedEditor, env: "wsl",    path: getActiveTargetPath() });
-            await resetToCenter();
+            invoke("record_tool", { toolName: selectedEditor, editorName: selectedEditor, env: "wsl", path: getActiveTargetPath(), name: curName }).catch(() => {});
+            await invoke("launch_editor", { editor: selectedEditor, env: "wsl", path: getActiveTargetPath() });
+            await hideWindow();
           }
           return;
         }
 
         if (showFolderTools) {
           if (action.startsWith("select_")) {
-            selectedEditor = action.replace("select_", "");
-            expansionPos = 0; targetExpansion = 1; startAnimation();
+            selectedEditor = action.replace("select_", ""); expansionPos = 0; targetExpansion = 1; startAnimation();
           } else if (action === "opencode") {
-            await invoke("open_wsl_opencode", { path: getActiveTargetPath(), prompt: "start" });
-            await resetToCenter();
+            invoke("record_tool", { toolName: "opencode", editorName: null, env: null, path: currentPath, name: curName }).catch(() => {});
+            await invoke("open_wsl_opencode", { path: getActiveTargetPath(), prompt: "start" }); await hideWindow();
           } else if (action === "powershell") {
-            await invoke("open_powershell", { path: currentPath });
-            await resetToCenter();
+            invoke("record_tool", { toolName: "powershell", editorName: null, env: null, path: currentPath, name: curName }).catch(() => {});
+            await invoke("open_powershell", { path: currentPath }); await hideWindow();
           } else if (action === "cmd") {
-            await invoke("open_cmd", { path: currentPath });
-            await resetToCenter();
+            invoke("record_tool", { toolName: "cmd", editorName: null, env: null, path: currentPath, name: curName }).catch(() => {});
+            await invoke("open_cmd", { path: currentPath }); await hideWindow();
           } else if (action === "back") {
-            showFolderTools = false;
-            expansionPos = 0; targetExpansion = 1; startAnimation();
+            showFolderTools = false; expansionPos = 0; targetExpansion = 1; startAnimation();
           }
           return;
         }
 
         if (selectedFile) {
           if (action.startsWith("select_")) {
-            selectedEditor = action.replace("select_", "");
-            expansionPos = 0; targetExpansion = 1; startAnimation();
+            selectedEditor = action.replace("select_", ""); expansionPos = 0; targetExpansion = 1; startAnimation();
           } else if (action === "opencode") {
-            await invoke("open_wsl_opencode", { path: getActiveTargetPath(), prompt: "start" });
-            await resetToCenter();
+            invoke("record_tool", { toolName: "opencode", editorName: null, env: null, path: selectedFile.path, name: selectedFile.name }).catch(() => {});
+            await invoke("open_wsl_opencode", { path: getActiveTargetPath(), prompt: "start" }); await hideWindow();
           } else if (action === "back") {
             const ps = pathHistory.pop();
             if (ps) { currentPath = ps.path; originX = ps.x; originY = ps.y; }
-            selectedFile = null;
-            expansionPos = 0; targetExpansion = 1; startAnimation();
+            selectedFile = null; expansionPos = 0; targetExpansion = 1; startAnimation();
           } else if (action === "powershell") {
-            await invoke("open_powershell", { path: selectedFile.path });
-            await resetToCenter();
+            invoke("record_tool", { toolName: "powershell", editorName: null, env: null, path: selectedFile.path, name: selectedFile.name }).catch(() => {});
+            await invoke("open_powershell", { path: selectedFile.path }); await hideWindow();
           } else if (action === "cmd") {
-            await invoke("open_cmd", { path: selectedFile.path });
-            await resetToCenter();
+            invoke("record_tool", { toolName: "cmd", editorName: null, env: null, path: selectedFile.path, name: selectedFile.name }).catch(() => {});
+            await invoke("open_cmd", { path: selectedFile.path }); await hideWindow();
           }
           return;
         }
@@ -743,17 +591,11 @@ window.addEventListener("DOMContentLoaded", () => {
 
     if (!selectedFile && !selectedEditor && !showFolderTools) {
       if (draggedAway || hoveredNodeIndex === null || animatedNodes[hoveredNodeIndex]?.key !== "center") {
-        showFolderTools = true;
-        expansionPos = 0;
-        targetExpansion = 1;
-        startAnimation();
+        showFolderTools = true; expansionPos = 0; targetExpansion = 1; startAnimation();
       }
     }
   });
 
-  loadCurrentDirectory().then(() => {
-    startAnimation();
-  });
-
+  loadCurrentDirectory().then(() => { startAnimation(); });
   enable().catch(() => {});
 });

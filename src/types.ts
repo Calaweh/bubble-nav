@@ -8,6 +8,11 @@ export interface HistoryState {
   path: string;
   x: number;
   y: number;
+  // Offset of the satellite node we entered, relative to the parent's originX/Y.
+  // i.e. exitX = node.curX - originX at the moment of doNavigateDown.
+  // Reconstruct absolute position on the way back as: parentOriginX + exitX.
+  exitX: number;
+  exitY: number;
 }
 
 export interface RenderNode {

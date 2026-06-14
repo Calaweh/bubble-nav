@@ -44,10 +44,12 @@ The content is organized as follows:
 .env.example
 .github/workflows/build.yml
 .gitignore
+.opencode/@checkpoints
 index.html
 package.json
 README.md
 repomix.config.json
+screenshots/.gitkeep
 src-tauri/.gitignore
 src-tauri/build.rs
 src-tauri/capabilities/default.json
@@ -71,6 +73,7 @@ src-tauri/icons/Square89x89Logo.png
 src-tauri/icons/StoreLogo.png
 src-tauri/src/lib.rs
 src-tauri/src/main.rs
+src-tauri/src/stats.rs
 src-tauri/tauri.conf.json
 src/config.ts
 src/index.html
@@ -87,6 +90,230 @@ vite.config.ts
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path=".opencode/@checkpoints">
+6cafb08b18d78253174bc8b39e0906ead5d84542 checkpoint: 2026-06-14T01:45:25Z
+</file>
+
+<file path="src-tauri/src/stats.rs">
+use rusqlite::Connection;
+use serde::Serialize;
+use std::sync::Mutex;
+
+pub struct StatsDb {
+    conn: Mutex<Connection>,
+    pub session_id: String,
+}
+
+#[derive(Serialize)]
+pub struct NodeStat {
+    pub path: String,
+    pub name: String,
+    pub is_dir: bool,
+    pub select_count: i64,
+    pub navigate_count: i64,
+    pub pass_through_count: i64,
+}
+
+#[derive(Serialize)]
+pub struct ToolStat {
+    pub tool_name: String,
+    pub editor_name: Option<String>,
+    pub env: Option<String>,
+    pub used_count: i64,
+}
+
+impl StatsDb {
+    pub fn new(db_path: std::path::PathBuf) -> Result<Self, rusqlite::Error> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS node_stats (
+                path TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                is_dir INTEGER NOT NULL DEFAULT 0,
+                select_count INTEGER NOT NULL DEFAULT 0,
+                navigate_count INTEGER NOT NULL DEFAULT 0,
+                pass_through_count INTEGER NOT NULL DEFAULT 0,
+                last_accessed TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS tool_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_name TEXT NOT NULL,
+                editor_name TEXT,
+                env TEXT,
+                used_count INTEGER NOT NULL DEFAULT 1,
+                last_used TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(tool_name, editor_name, env)
+            );
+            CREATE TABLE IF NOT EXISTS navigation_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                tool_name TEXT,
+                timestamp TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )?;
+        let session_id = format!(
+            "{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        Ok(StatsDb {
+            conn: Mutex::new(conn),
+            session_id,
+        })
+    }
+
+    pub fn record_navigate(&self, path: &str, name: &str, is_dir: bool) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO node_stats (path, name, is_dir, navigate_count, last_accessed)
+             VALUES (?1, ?2, ?3, 1, datetime('now'))
+             ON CONFLICT(path) DO UPDATE SET
+               navigate_count = navigate_count + 1,
+               last_accessed = datetime('now')",
+            rusqlite::params![path, name, is_dir],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO navigation_log (session_id, path, name, event_type)
+             VALUES (?1, ?2, ?3, 'navigate')",
+            rusqlite::params![self.session_id, path, name],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn record_pass_through(&self, path: &str, name: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE node_stats
+             SET pass_through_count = pass_through_count + 1,
+                 last_accessed = datetime('now')
+             WHERE path = ?1",
+            rusqlite::params![path],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO navigation_log (session_id, path, name, event_type)
+             VALUES (?1, ?2, ?3, 'pass_through')",
+            rusqlite::params![self.session_id, path, name],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn record_select(&self, path: &str, name: &str, is_dir: bool) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO node_stats (path, name, is_dir, select_count, last_accessed)
+             VALUES (?1, ?2, ?3, 1, datetime('now'))
+             ON CONFLICT(path) DO UPDATE SET
+               select_count = select_count + 1,
+               last_accessed = datetime('now')",
+            rusqlite::params![path, name, is_dir],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO navigation_log (session_id, path, name, event_type)
+             VALUES (?1, ?2, ?3, 'select')",
+            rusqlite::params![self.session_id, path, name],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn record_tool(
+        &self,
+        tool_name: &str,
+        editor_name: Option<&str>,
+        env: Option<&str>,
+        path: &str,
+        name: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO tool_usage (tool_name, editor_name, env, used_count, last_used)
+             VALUES (?1, ?2, ?3, 1, datetime('now'))
+             ON CONFLICT(tool_name, editor_name, env) DO UPDATE SET
+               used_count = used_count + 1,
+               last_used = datetime('now')",
+            rusqlite::params![tool_name, editor_name, env],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO navigation_log (session_id, path, name, event_type, tool_name)
+             VALUES (?1, ?2, ?3, 'tool_launch', ?4)",
+            rusqlite::params![self.session_id, path, name, tool_name],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn get_frequent_nodes(&self, limit: i64) -> Result<Vec<NodeStat>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT path, name, is_dir, select_count, navigate_count, pass_through_count
+                 FROM node_stats
+                 ORDER BY (navigate_count + select_count + pass_through_count) DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit], |row| {
+                Ok(NodeStat {
+                    path: row.get(0)?,
+                    name: row.get(1)?,
+                    is_dir: row.get::<_, i64>(2)? != 0,
+                    select_count: row.get(3)?,
+                    navigate_count: row.get(4)?,
+                    pass_through_count: row.get(5)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(result)
+    }
+
+    pub fn get_frequent_tools(&self, limit: i64) -> Result<Vec<ToolStat>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT tool_name, editor_name, env, used_count
+                 FROM tool_usage
+                 ORDER BY used_count DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit], |row| {
+                Ok(ToolStat {
+                    tool_name: row.get(0)?,
+                    editor_name: row.get(1)?,
+                    env: row.get(2)?,
+                    used_count: row.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(|e| e.to_string())?);
+        }
+        Ok(result)
+    }
+}
+</file>
 
 <file path=".github/workflows/build.yml">
 name: Build
@@ -172,6 +399,7 @@ dist-ssr
 
 # Environment variables
 .env
+*.exe
 </file>
 
 <file path="index.html">
@@ -192,16 +420,6 @@ dist-ssr
 </html>
 </file>
 
-<file path="README.md">
-# Tauri + Vanilla TS
-
-This template should help get you started developing with Tauri in vanilla HTML, CSS and Typescript.
-
-## Recommended IDE Setup
-
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
-</file>
-
 <file path="repomix.config.json">
 {
   "output": {
@@ -216,6 +434,10 @@ This template should help get you started developing with Tauri in vanilla HTML,
     ]
   }
 }
+</file>
+
+<file path="screenshots/.gitkeep">
+
 </file>
 
 <file path="src-tauri/.gitignore">
@@ -259,41 +481,6 @@ fn main() {
 }
 </file>
 
-<file path="src-tauri/tauri.conf.json">
-{
-  "$schema": "https://raw.githubusercontent.com/nicovrc/tauri-config-schema/main/schema.json",
-  "productName": "bubble-nav",
-  "version": "0.1.0",
-  "identifier": "com.bubble-nav.app",
-  "build": {
-    "frontendDist": "../dist",
-    "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": ""
-  },
-  "app": {
-    "windows": [
-      {
-        "label": "main",
-        "title": "bubble-nav",
-        "width": 1200,
-        "height": 900,
-        "resizable": false,
-        "transparent": true,
-        "decorations": false,
-        "alwaysOnTop": true,
-        "center": true,
-        "skipTaskbar": true,
-        "visible": false
-      }
-    ],
-    "security": {
-      "csp": null
-    }
-  }
-}
-</file>
-
 <file path="src/index.html">
 <!DOCTYPE html>
 <html lang="en">
@@ -310,157 +497,6 @@ fn main() {
     <script type="module" src="/main.ts"></script>
   </body>
 </html>
-</file>
-
-<file path="src/layout.ts">
-import { FileItem, HistoryState, RenderNode } from "./types";
-import { TOOLS } from "./config";
-import { getParentPath } from "./utils";
-
-export function calculateLayout(
-  currentPath: string,
-  selectedFile: FileItem | null,
-  selectedEditor: string | null,
-  showFolderTools: boolean,
-  originX: number,
-  originY: number,
-  expansionPos: number,
-  pathHistory: HistoryState[],
-  itemsList: FileItem[]
-): RenderNode[] {
-  const newVisible: RenderNode[] = [];
-  const pathParts  = currentPath.split(/[\\/]/);
-  const folderName = selectedFile
-    ? selectedFile.name
-    : (pathParts[pathParts.length - 1] || currentPath);
-
-  newVisible.push({
-    label:     selectedEditor ? selectedEditor.toUpperCase() : folderName,
-    isDir:     !selectedFile,
-    isAction:  false,
-    isBack:    false,
-    worldX:    originX,
-    worldY:    originY,
-    radius:    65,
-    baseColor: selectedEditor ? "#8e44ad" : selectedFile ? "#e2a94a" : "#2c313a"
-  });
-
-  const angles: number[] = [];
-  const parentState = pathHistory[pathHistory.length - 1];
-
-  // Check if currentPath has a parent directory dynamically
-  const hasParent = getParentPath(currentPath) !== null;
-
-  // Use history parents or generate a virtual parent direction above
-  let resolvedParentState = parentState;
-  if (!resolvedParentState && hasParent && !selectedFile && !showFolderTools && !selectedEditor) {
-    resolvedParentState = { path: "", x: originX, y: originY - 200 };
-  }
-
-  let satCount = 0;
-  if (selectedEditor) {
-    satCount = new Set(["vscode","antigravity","visualstudio"]).has(selectedEditor) ? 3 : 2;
-  } else if (selectedFile || showFolderTools) {
-    satCount = TOOLS.length;
-  } else {
-    satCount = Math.min(itemsList.length, 12);
-  }
-
-  // Bi-arc layout only when actively browsing folders and files
-  const isBrowsing = !selectedFile && !showFolderTools && !selectedEditor;
-  if (resolvedParentState && satCount > 0 && isBrowsing) {
-    const dx = resolvedParentState.x - originX;
-    const dy = resolvedParentState.y - originY;
-    const angleToParent = Math.atan2(dy, dx);
-    const halfCount = Math.ceil(satCount / 2);
-    const arcSpan   = Math.PI * 0.52;
-    const start1    = (angleToParent + Math.PI / 2) - arcSpan / 2;
-    for (let i = 0; i < halfCount; i++) {
-      angles.push(halfCount === 1 ? angleToParent + Math.PI / 2
-        : start1 + (i * arcSpan) / (halfCount - 1));
-    }
-    const rem = satCount - halfCount;
-    if (rem > 0) {
-      const start2 = (angleToParent - Math.PI / 2) - arcSpan / 2;
-      for (let i = 0; i < rem; i++) {
-        angles.push(rem === 1 ? angleToParent - Math.PI / 2
-          : start2 + (i * arcSpan) / (rem - 1));
-      }
-    }
-  } else {
-    // Standard full circle even spacing
-    for (let i = 0; i < satCount; i++) {
-      angles.push((2 * Math.PI * i) / satCount - Math.PI / 2);
-    }
-  }
-
-  if (selectedEditor) {
-    const dist = 180 * expansionPos;
-    const envActions = [
-      { label: "Windows", action: "launch_window",  color: "#2ecc71" },
-      ...(new Set(["vscode","antigravity","visualstudio"]).has(selectedEditor)
-        ? [{ label: "WSL", action: "launch_wsl",    color: "#8e44ad" }]
-        : []),
-      { label: "↩ Back",  action: "cancel_editor",  color: "#c0392b" }
-    ];
-    envActions.forEach((act, i) => {
-      newVisible.push({
-        label: act.label, isDir: false, isAction: true, isBack: false,
-        actionId: act.action,
-        worldX: originX + dist * Math.cos(angles[i]),
-        worldY: originY + dist * Math.sin(angles[i]),
-        radius: 40, baseColor: act.color
-      });
-    });
-  } else if (selectedFile || showFolderTools) {
-    const dist = 180 * expansionPos;
-    TOOLS.forEach((tool, i) => {
-      let label = tool.label;
-      // If folder tools, rename back action label to "↩ back" instead of "↩ cd .."
-      if (showFolderTools && tool.action === "back") {
-        label = "↩ back";
-      }
-      newVisible.push({
-        label: label, isDir: false, isAction: true, isBack: false,
-        actionId: tool.action,
-        worldX: originX + dist * Math.cos(angles[i]),
-        worldY: originY + dist * Math.sin(angles[i]),
-        radius: 40, baseColor: tool.color
-      });
-    });
-  } else {
-    const dist = 200 * expansionPos;
-
-    // 1) Position the cd .. back button precisely facing the parent direction
-    if (hasParent && resolvedParentState) {
-      const dx = resolvedParentState.x - originX;
-      const dy = resolvedParentState.y - originY;
-      const ang = Math.atan2(dy, dx);
-      newVisible.push({
-        label: "↩ cd ..", isDir: true, isAction: false, isBack: true,
-        worldX: originX + dist * Math.cos(ang),
-        worldY: originY + dist * Math.sin(ang),
-        radius: 38, baseColor: "#c0392b"
-      });
-    }
-
-    // 2) Position standard directory file and folder elements
-    for (let i = 0; i < Math.min(itemsList.length, 12); i++) {
-      const item = itemsList[i];
-      const angle = angles[i];
-      newVisible.push({
-        label: item.name, isDir: item.is_dir, isAction: false, isBack: false,
-        path: item.path,
-        worldX: originX + dist * Math.cos(angle),
-        worldY: originY + dist * Math.sin(angle),
-        radius: item.is_dir ? 45 : 35,
-        baseColor: item.is_dir ? "#4a90e2" : "#e2a94a"
-      });
-    }
-  }
-
-  return newVisible;
-}
 </file>
 
 <file path="src/renderer.ts">
@@ -594,6 +630,11 @@ export interface HistoryState {
   path: string;
   x: number;
   y: number;
+  // Offset of the satellite node we entered, relative to the parent's originX/Y.
+  // i.e. exitX = node.curX - originX at the moment of doNavigateDown.
+  // Reconstruct absolute position on the way back as: parentOriginX + exitX.
+  exitX: number;
+  exitY: number;
 }
 
 export interface RenderNode {
@@ -818,14 +859,329 @@ tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dotenvy = "0.15"
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-autostart = "2"
 </file>
 
+<file path="src/layout.ts">
+import { FileItem, HistoryState, RenderNode } from "./types";
+import { TOOLS } from "./config";
+import { getParentPath } from "./utils";
+
+export function calculateLayout(
+  currentPath: string,
+  selectedFile: FileItem | null,
+  selectedEditor: string | null,
+  showFolderTools: boolean,
+  originX: number,
+  originY: number,
+  expansionPos: number,
+  pathHistory: HistoryState[],
+  itemsList: FileItem[],
+  justExitedPath?: string | null,
+  justExitedX?: number | null,
+  justExitedY?: number | null
+): RenderNode[] {
+  const newVisible: RenderNode[] = [];
+  const pathParts  = currentPath.split(/[\\/]/);
+  const folderName = selectedFile
+    ? selectedFile.name
+    : (pathParts[pathParts.length - 1] || currentPath);
+
+  // Center node
+  newVisible.push({
+    label:     selectedEditor ? selectedEditor.toUpperCase() : folderName,
+    isDir:     !selectedFile,
+    isAction:  false,
+    isBack:    false,
+    worldX:    originX,
+    worldY:    originY,
+    radius:    65,
+    baseColor: selectedEditor ? "#8e44ad" : selectedFile ? "#e2a94a" : "#2c313a"
+  });
+
+  const isBrowsing = !selectedFile && !showFolderTools && !selectedEditor;
+
+  if (isBrowsing) {
+    const dist = 200 * expansionPos;
+    const hasParent = getParentPath(currentPath) !== null;
+    const parentState = pathHistory[pathHistory.length - 1];
+
+    let resolvedParentState = parentState;
+    if (!resolvedParentState && hasParent) {
+      resolvedParentState = { path: "", x: originX, y: originY - 200, exitX: originX, exitY: originY - 200 };
+    }
+
+    let angleToParent = -Math.PI / 2;
+    if (resolvedParentState) {
+      const dx = resolvedParentState.x - originX;
+      const dy = resolvedParentState.y - originY;
+      angleToParent = Math.atan2(dy, dx);
+    }
+
+    // cd.. is a separate button — never consumes an item slot
+    const maxItems = 12;
+    const itemsToDisplay = itemsList.slice(0, maxItems);
+
+    let exitedItemIndex = -1;
+    if (justExitedPath) {
+      const normExited = justExitedPath.replace(/\\/g, "/").toLowerCase();
+      exitedItemIndex = itemsToDisplay.findIndex(item =>
+        item.path.replace(/\\/g, "/").toLowerCase() === normExited
+      );
+    }
+
+    if (exitedItemIndex !== -1) {
+      // ── Cases 1 & 2: exited folder is in this list ──────────────────────────
+      //
+      // All items sit at their NORMAL positions (same formula as Case 3/4).
+      // The exited item gets yellow and is placed at justExitedX/Y — which is
+      // now stored as an absolute canvas position correctly derived from the
+      // parent's origin offset, so it matches the node's previous screen location.
+
+      if (hasParent) {
+        // cd.. back button
+        newVisible.push({
+          label: "↩ cd ..", isDir: true, isAction: false, isBack: true,
+          worldX: originX + dist * Math.cos(angleToParent),
+          worldY: originY + dist * Math.sin(angleToParent),
+          radius: 38,
+          baseColor: "#c0392b"
+        });
+
+        const N = itemsToDisplay.length;
+        itemsToDisplay.forEach((item, i) => {
+          const isExited = i === exitedItemIndex;
+          // Normal Case-3 angle for this slot
+          const angle   = angleToParent + (2 * Math.PI * (i + 1)) / (N + 1);
+          const normalX = originX + dist * Math.cos(angle);
+          const normalY = originY + dist * Math.sin(angle);
+          newVisible.push({
+            label: item.name, isDir: item.is_dir, isAction: false, isBack: false,
+            path: item.path,
+            // Yellow node uses its original screen position (stored as absolute coords);
+            // everything else stays at its normal slot.
+            worldX: isExited && justExitedX != null ? justExitedX : normalX,
+            worldY: isExited && justExitedY != null ? justExitedY : normalY,
+            radius: item.is_dir ? 45 : 35,
+            baseColor: isExited ? "#f1c40f" : (item.is_dir ? "#4a90e2" : "#2ecc71")
+          });
+        });
+
+      } else {
+        // No parent — Normal Case-4 angles, yellow placed at original position
+        const N = itemsToDisplay.length;
+        itemsToDisplay.forEach((item, i) => {
+          const isExited = i === exitedItemIndex;
+          const angle   = (2 * Math.PI * i) / N - Math.PI / 2;
+          const normalX = originX + dist * Math.cos(angle);
+          const normalY = originY + dist * Math.sin(angle);
+          newVisible.push({
+            label: item.name, isDir: item.is_dir, isAction: false, isBack: false,
+            path: item.path,
+            worldX: isExited && justExitedX != null ? justExitedX : normalX,
+            worldY: isExited && justExitedY != null ? justExitedY : normalY,
+            radius: item.is_dir ? 45 : 35,
+            baseColor: isExited ? "#f1c40f" : (item.is_dir ? "#4a90e2" : "#2ecc71")
+          });
+        });
+      }
+
+    } else if (hasParent) {
+      // ─── Case 3: Has parent, no just-exited folder ───
+      const N = itemsToDisplay.length;
+      newVisible.push({
+        label: "↩ cd ..", isDir: true, isAction: false, isBack: true,
+        worldX: originX + dist * Math.cos(angleToParent),
+        worldY: originY + dist * Math.sin(angleToParent),
+        radius: 38,
+        baseColor: "#c0392b"
+      });
+      itemsToDisplay.forEach((item, i) => {
+        const angle = angleToParent + (2 * Math.PI * (i + 1)) / (N + 1);
+        newVisible.push({
+          label: item.name, isDir: item.is_dir, isAction: false, isBack: false,
+          path: item.path,
+          worldX: originX + dist * Math.cos(angle),
+          worldY: originY + dist * Math.sin(angle),
+          radius: item.is_dir ? 45 : 35,
+          baseColor: item.is_dir ? "#4a90e2" : "#2ecc71"
+        });
+      });
+
+    } else {
+      // ─── Case 4: No parent, no just-exited folder (root) ───
+      const N = itemsToDisplay.length;
+      itemsToDisplay.forEach((item, i) => {
+        const angle = (2 * Math.PI * i) / N - Math.PI / 2;
+        newVisible.push({
+          label: item.name, isDir: item.is_dir, isAction: false, isBack: false,
+          path: item.path,
+          worldX: originX + dist * Math.cos(angle),
+          worldY: originY + dist * Math.sin(angle),
+          radius: item.is_dir ? 45 : 35,
+          baseColor: item.is_dir ? "#4a90e2" : "#2ecc71"
+        });
+      });
+    }
+
+  } else {
+    // ── Actions / Tools layout (unchanged) ──────────────────────────────────
+    const angles: number[] = [];
+    let satCount = 0;
+    if (selectedEditor) {
+      satCount = new Set(["vscode","antigravity","visualstudio"]).has(selectedEditor) ? 3 : 2;
+    } else if (selectedFile || showFolderTools) {
+      satCount = TOOLS.length;
+    }
+    for (let i = 0; i < satCount; i++) {
+      angles.push((2 * Math.PI * i) / satCount - Math.PI / 2);
+    }
+
+    if (selectedEditor) {
+      const dist = 180 * expansionPos;
+      const envActions = [
+        { label: "Windows", action: "launch_window",  color: "#2ecc71" },
+        ...(new Set(["vscode","antigravity","visualstudio"]).has(selectedEditor)
+          ? [{ label: "WSL", action: "launch_wsl", color: "#8e44ad" }]
+          : []),
+        { label: "↩ Back", action: "cancel_editor", color: "#c0392b" }
+      ];
+      envActions.forEach((act, i) => {
+        newVisible.push({
+          label: act.label, isDir: false, isAction: true, isBack: false,
+          actionId: act.action,
+          worldX: originX + dist * Math.cos(angles[i]),
+          worldY: originY + dist * Math.sin(angles[i]),
+          radius: 40, baseColor: act.color
+        });
+      });
+    } else if (selectedFile || showFolderTools) {
+      const dist = 180 * expansionPos;
+      TOOLS.forEach((tool, i) => {
+        const label = (showFolderTools && tool.action === "back") ? "↩ back" : tool.label;
+        newVisible.push({
+          label, isDir: false, isAction: true, isBack: false,
+          actionId: tool.action,
+          worldX: originX + dist * Math.cos(angles[i]),
+          worldY: originY + dist * Math.sin(angles[i]),
+          radius: 40, baseColor: tool.color
+        });
+      });
+    }
+  }
+
+  return newVisible;
+}
+</file>
+
+<file path="README.md">
+# bubble-nav
+
+> "The current File Explorer navigation is not intuitive, convenient for me. So I made this
+> coooooooooooooool, funny(?) radial canvas overlay with a hold-to-navigate gesture wheel —
+> tether, snap, and flow through directories like a spatial command center!!! (and I lazy
+> to find alternative solution, maybe better existing, but just for fun haha)"
+
+## Screenshots
+
+<!-- Add screenshots here -->
+
+Radial canvas overlay for Windows file explorer — navigate directories and launch tools via
+hold-to-drag gestures on a spatial bubble wheel. Uses Tauri for the native overlay window
+and IPC, with a pure TypeScript canvas renderer.
+
+## Features
+
+- **Spatial navigation** — drag outward from center to reveal satellites; slide over a folder
+  to enter it, over a file to see tools, over ↩ to go up. The "just-exited" folder stays
+  pinned in yellow at its screen position so you can instantly go back.
+- **Hold-to-drag** — press and hold the center bubble, drag across targets, release on
+  empty space to see folder tools. Discrete click shortcuts also work.
+- **Bi-arc / full-circle layout** — browsing uses a parent-oriented bi-arc; tool menus
+  use perfect full-circle spacing.
+- **Autostart** — registers on Windows startup; Alt+Space toggles the overlay.
+- **Editor launcher** — open files/folders in VS Code, Antigravity IDE, or Visual Studio
+  (configured via `.env`).
+- **WSL-aware** — opens WSL instances and resolves `\\wsl.localhost\` paths.
+
+## Setup
+
+1. Copy `.env.example` → `.env` and fill in your editor paths and start directory.
+2. `npm install`
+3. `cargo tauri dev` (requires Rust + GTK dev libs on Linux build host, or native
+   Windows toolchain)
+
+### Required `.env` values
+
+| Variable | Description |
+|---|---|
+| `WSL_DISTRO` | WSL distro name (e.g. `Ubuntu`) |
+| `VSCODE_BIN` | Path to VS Code binary (WSL path for WSL, Windows path for Windows) |
+| `ANTIGRAVITY_PATH` | Absolute Windows path to Antigravity IDE (`D:\...`) |
+| `VISUALSTUDIO_PATH` | Absolute Windows path to devenv.exe |
+| `OPENCODE_BIN` | WSL path to opencode binary |
+| `VITE_START_PATH` | Initial directory shown on launch |
+
+## Commands
+
+| Key / Gesture | Action |
+|---|---|
+| Hold center + drag | Navigate / preview tools |
+| Release on empty space | Show folder tools |
+| Click satellite | Direct navigation / action |
+| Alt+Space | Toggle overlay |
+
+## Architecture
+
+```
+src/          — TypeScript canvas app (main, layout, renderer, utils, types, config)
+src-tauri/    — Rust backend (global shortcut, WSL resolution, editor launcher, IPC)
+```
+
+Built with [Tauri](https://tauri.app/) v2.
+</file>
+
+<file path="src-tauri/tauri.conf.json">
+{
+  "$schema": "https://raw.githubusercontent.com/nicovrc/tauri-config-schema/main/schema.json",
+  "productName": "bubble-nav",
+  "version": "0.1.0",
+  "identifier": "com.bubble-nav.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "bubble-nav",
+        "width": 1200,
+        "height": 900,
+        "resizable": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "center": true,
+        "skipTaskbar": true,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  }
+}
+</file>
+
 <file path="src/config.ts">
-export const START_PATH = import.meta.env.VITE_START_PATH || "";
+export const START_PATH = import.meta.env.VITE_START_PATH || "D:\\Projects";
 
 export const EXPAND_RATE   = 0.28;
 export const COLLAPSE_RATE = 0.32;
@@ -856,729 +1212,9 @@ export const TOOLS: ToolDef[] = [
 ];
 </file>
 
-<file path="src/main.ts">
-import { invoke } from "@tauri-apps/api/core";
-import { enable } from "@tauri-apps/plugin-autostart";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-
-import { FileItem, HistoryState, RenderNode, AnimatedNode } from "./types";
-import { 
-  START_PATH, 
-  EXPAND_RATE, 
-  COLLAPSE_RATE, 
-  NODE_MOVE_RATE, 
-  NODE_ALPHA_RATE, 
-  NODE_RAD_RATE, 
-  NODE_EXIT_RATE, 
-  POS_SNAP, 
-  ALPHA_SNAP, 
-  RAD_SNAP 
-} from "./config";
-import { 
-  lerpSnap, 
-  getParentPath, 
-  getNodeAtPosition, 
-  clampCoordinates, 
-  nodeKey 
-} from "./utils";
-import { drawBubble, drawConnection, drawLabel } from "./renderer";
-import { calculateLayout } from "./layout";
-
-let currentPath = START_PATH;
-let itemsList: FileItem[] = [];
-let selectedFile: FileItem | null = null;
-
-let showFolderTools = false;
-let selectedEditor: string | null = null;
-
-let originX = window.innerWidth / 2;
-let originY = window.innerHeight / 2;
-
-let expansionPos    = 0;
-let targetExpansion = 1; // Always expanded by default
-
-let lastFrameTime = 0;
-let isAnimating = false;
-
-// Hold-to-navigate state
-let isHolding   = false;
-let draggedAway = false;
-let mouseDownX  = 0;
-let mouseDownY  = 0;
-
-// Async loading lock to prevent thread lag
-let isLoadingDir = false;
-
-// Cursor tracking for holding tether line
-let currentMouseX = window.innerWidth / 2;
-let currentMouseY = window.innerHeight / 2;
-
-let pathHistory: HistoryState[] = [];
-let hoveredNodeIndex: number | null = null;
-
-let visibleNodes: RenderNode[] = [];
-let animatedNodes: AnimatedNode[] = [];
-
-function getActiveTargetPath(): string {
-  return selectedFile ? selectedFile.path : currentPath;
-}
-
-function syncAnimatedNodes(dt: number): boolean {
-  let moving = false;
-  const usedKeys = new Set<string>();
-
-  visibleNodes.forEach((node, index) => {
-    const key = nodeKey(node, index);
-    usedKeys.add(key);
-
-    let anim = animatedNodes.find((a) => a.key === "center");
-    if (index !== 0 || !anim) {
-      anim = animatedNodes.find((a) => a.key === key);
-    }
-    
-    if (!anim) {
-      const isCenter = index === 0;
-      const centerAnim = animatedNodes.find(a => a.key === "center");
-      anim = {
-        ...node, key,
-        curX:      isCenter ? node.worldX : (centerAnim ? centerAnim.curX : originX),
-        curY:      isCenter ? node.worldY : (centerAnim ? centerAnim.curY : originY),
-        curRadius: isCenter ? node.radius : 0,
-        curAlpha:  isCenter ? 1 : 0,
-      };
-      animatedNodes.push(anim);
-    }
-
-    anim.label     = node.label;
-    anim.isDir     = node.isDir;
-    anim.isAction  = node.isAction;
-    anim.isBack    = node.isBack;
-    anim.actionId  = node.actionId;
-    anim.path      = node.path;
-    anim.worldX    = node.worldX;
-    anim.worldY    = node.worldY;
-    anim.radius    = node.radius;
-    anim.baseColor = node.baseColor;
-
-    const tgtAlpha = index === 0 ? 1 : expansionPos;
-
-    const newX = lerpSnap(anim.curX,      anim.worldX, NODE_MOVE_RATE,  dt, POS_SNAP);
-    const newY = lerpSnap(anim.curY,      anim.worldY, NODE_MOVE_RATE,  dt, POS_SNAP);
-    const newR = lerpSnap(anim.curRadius, anim.radius, NODE_RAD_RATE,   dt, RAD_SNAP);
-    const newA = lerpSnap(anim.curAlpha,  tgtAlpha,    NODE_ALPHA_RATE, dt, ALPHA_SNAP);
-
-    if (newX !== anim.curX || newY !== anim.curY || newR !== anim.curRadius || newA !== anim.curAlpha)
-      moving = true;
-
-    anim.curX = newX; anim.curY = newY; anim.curRadius = newR; anim.curAlpha = newA;
-  });
-
-  animatedNodes = animatedNodes.filter((a) => {
-    if (usedKeys.has(a.key)) return true;
-    const newX = lerpSnap(a.curX,      originX, NODE_EXIT_RATE, dt, POS_SNAP);
-    const newY = lerpSnap(a.curY,      originY, NODE_EXIT_RATE, dt, POS_SNAP);
-    const newR = lerpSnap(a.curRadius, 0,       NODE_EXIT_RATE, dt, RAD_SNAP);
-    const newA = lerpSnap(a.curAlpha,  0,       NODE_EXIT_RATE, dt, ALPHA_SNAP);
-    if (newX !== a.curX || newY !== a.curY || newR !== a.curRadius || newA !== a.curAlpha) moving = true;
-    a.curX = newX; a.curY = newY; a.curRadius = newR; a.curAlpha = newA;
-    return a.curRadius > RAD_SNAP || a.curAlpha > ALPHA_SNAP;
-  });
-
-  animatedNodes.sort((a, b) => {
-    if (a.key === "center") return -1;
-    if (b.key === "center") return 1;
-    return 0;
-  });
-
-  return moving;
-}
-
-window.addEventListener("DOMContentLoaded", () => {
-  const canvas = document.getElementById("bubble-canvas") as HTMLCanvasElement;
-  if (!canvas) return;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-
-  function resizeCanvas() {
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width  = window.innerWidth  * dpr;
-    canvas.height = window.innerHeight * dpr;
-    canvas.style.width  = `${window.innerWidth}px`;
-    canvas.style.height = `${window.innerHeight}px`;
-    ctx!.setTransform(dpr, 0, 0, dpr, 0, 0);
-    if (!showFolderTools && !selectedFile) {
-      originX = window.innerWidth  / 2;
-      originY = window.innerHeight / 2;
-    }
-  }
-  window.addEventListener("resize", resizeCanvas);
-  resizeCanvas();
-
-  async function loadCurrentDirectory() {
-    if (isLoadingDir) return;
-    isLoadingDir = true;
-    try {
-      itemsList = await invoke("read_directory", { path: currentPath });
-      selectedFile = null;
-      startAnimation();
-    } catch (err) {
-      console.error("Failed to load path:", err);
-    } finally {
-      isLoadingDir = false;
-    }
-  }
-
-  function startAnimation() {
-    if (isAnimating) return;
-    isAnimating   = true;
-    lastFrameTime = 0;
-    requestAnimationFrame(draw);
-  }
-
-  function triggerOpen() {
-    expansionPos    = 0;
-    targetExpansion = 1;
-    startAnimation();
-  }
-
-  function draw(timestamp: number) {
-    const dt = lastFrameTime
-      ? Math.min((timestamp - lastFrameTime) / (1000 / 60), 3)
-      : 1;
-    lastFrameTime = timestamp;
-
-    ctx!.clearRect(0, 0, window.innerWidth, window.innerHeight);
-
-    const rate = targetExpansion > expansionPos ? EXPAND_RATE : COLLAPSE_RATE;
-    expansionPos = lerpSnap(expansionPos, targetExpansion, rate, dt, 0.002);
-    const expansionSettled = expansionPos === targetExpansion;
-
-    visibleNodes = calculateLayout(
-      currentPath,
-      selectedFile,
-      selectedEditor,
-      showFolderTools,
-      originX,
-      originY,
-      expansionPos,
-      pathHistory,
-      itemsList
-    );
-    const nodesMoving = syncAnimatedNodes(dt);
-
-    // Draw active connections
-    const centerNode = animatedNodes.find(a => a.key === "center");
-    animatedNodes.forEach((node) => {
-      if (node.key === "center" || !centerNode) return;
-      const isHov = hoveredNodeIndex !== null
-        && animatedNodes[hoveredNodeIndex]?.key === node.key
-        && expansionPos > 0.85;
-      drawConnection(ctx!, centerNode.curX, centerNode.curY, node.curX, node.curY, node.curAlpha, isHov);
-    });
-
-    // Draw bubbles + labels
-    animatedNodes.forEach((node) => {
-      const isCenter = node.key === "center";
-      const isHov    = hoveredNodeIndex !== null
-        && animatedNodes[hoveredNodeIndex]?.key === node.key
-        && expansionPos > 0.85;
-      const alpha = isCenter ? 1 : node.curAlpha;
-      drawBubble(ctx!, node.curX, node.curY, node.curRadius, node.baseColor, alpha, isHov);
-      drawLabel(ctx!, node.label, node.curX, node.curY, node.curRadius, alpha, isCenter);
-    });
-
-    // Draw active tether on top — from bubble edge toward mouse cursor
-    if (isHolding) {
-      const cn = animatedNodes.find(a => a.key === "center");
-      if (cn) {
-        const hov = hoveredNodeIndex !== null ? animatedNodes[hoveredNodeIndex] : null;
-        const ax = hov && hov.key !== "center" ? hov.curX : cn.curX;
-        const ay = hov && hov.key !== "center" ? hov.curY : cn.curY;
-        const ar = hov && hov.key !== "center" ? hov.curRadius : cn.curRadius;
-        const dx = currentMouseX - ax;
-        const dy = currentMouseY - ay;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        const pad = ar + 4;
-        const sx = dist > pad ? ax + (dx / dist) * pad : ax;
-        const sy = dist > pad ? ay + (dy / dist) * pad : ay;
-        drawConnection(ctx!, sx, sy, currentMouseX, currentMouseY, 1, true);
-      }
-    }
-
-    if (expansionSettled && !nodesMoving && !isHolding) {
-      isAnimating = false;
-      return;
-    }
-
-    requestAnimationFrame(draw);
-  }
-
-  canvas.addEventListener("mousemove", async (e) => {
-    currentMouseX = e.clientX;
-    currentMouseY = e.clientY;
-
-    const prev = hoveredNodeIndex;
-    hoveredNodeIndex = getNodeAtPosition(e.clientX, e.clientY, animatedNodes);
-    canvas.style.cursor = hoveredNodeIndex !== null ? "pointer" : "default";
-    if (prev !== hoveredNodeIndex) startAnimation();
-
-    // Prevent any gesture updates while directory loading is active
-    if (isLoadingDir) return;
-
-    // Handle Drag / Touch while holding mouse button down
-    if (isHolding) {
-      const dx = e.clientX - mouseDownX;
-      const dy = e.clientY - mouseDownY;
-      if (dx * dx + dy * dy > 25 * 25) {
-        draggedAway = true;
-      }
-
-      // ONLY allow touching and going inside satellites after dragging away from the center bubble
-      if (draggedAway && hoveredNodeIndex !== null && expansionPos > 0.8) {
-        const hoveredAnim = animatedNodes[hoveredNodeIndex];
-        const hoveredNode = visibleNodes.find((n, idx) => nodeKey(n, idx) === hoveredAnim.key);
-
-        if (hoveredNode && hoveredAnim.key !== "center") {
-          // 1) Folder Hovered -> Continue deep into the folder
-          if (hoveredNode.isDir && hoveredNode.path && currentPath !== hoveredNode.path && !hoveredNode.isBack) {
-            pathHistory.push({ path: currentPath, x: originX, y: originY });
-            currentPath = hoveredNode.path;
-            const clamped = clampCoordinates(hoveredNode.worldX, hoveredNode.worldY);
-            originX = clamped.x;
-            originY = clamped.y;
-            
-            // Anchor drag reference directly on the new center coordinate
-            draggedAway = false;
-            mouseDownX  = originX;
-            mouseDownY  = originY;
-
-            hoveredNodeIndex = null;
-            expansionPos = 0;
-            targetExpansion = 1;
-            startAnimation();
-            await loadCurrentDirectory();
-            return;
-          }
-
-          // 2) cd .. Back Button Hovered -> Move up a folder level
-          if (hoveredNode.isBack) {
-            const ps = pathHistory.pop();
-            if (ps) {
-              currentPath = ps.path;
-              originX = ps.x;
-              originY = ps.y;
-            } else {
-              const parent = getParentPath(currentPath);
-              if (parent) {
-                currentPath = parent;
-              } else {
-                currentPath = START_PATH;
-              }
-              const clamped = clampCoordinates(hoveredNode.worldX, hoveredNode.worldY);
-              originX = clamped.x;
-              originY = clamped.y;
-            }
-
-            // Anchor drag reference directly on the new center coordinate
-            draggedAway = false;
-            mouseDownX  = originX;
-            mouseDownY  = originY;
-
-            hoveredNodeIndex = null;
-            expansionPos = 0;
-            targetExpansion = 1;
-            startAnimation();
-            await loadCurrentDirectory();
-            return;
-          }
-
-          // 3) File Hovered -> Switch instantly to showing tools for this file
-          if (!hoveredNode.isDir && !hoveredNode.isAction && hoveredNode.path && (!selectedFile || selectedFile.path !== hoveredNode.path)) {
-            pathHistory.push({ path: currentPath, x: originX, y: originY });
-            selectedFile = itemsList.find(i => i.path === hoveredNode.path) || null;
-            const clamped = clampCoordinates(hoveredNode.worldX, hoveredNode.worldY);
-            originX = clamped.x;
-            originY = clamped.y;
-            
-            // Anchor drag reference directly on the new center coordinate
-            draggedAway = false;
-            mouseDownX  = originX;
-            mouseDownY  = originY;
-
-            hoveredNodeIndex = null;
-            expansionPos = 0;
-            targetExpansion = 1;
-            startAnimation();
-            return;
-          }
-
-          // 4) Touch to trigger Sub-menu / Escape actions seamlessly while holding
-          if (hoveredNode.isAction && hoveredNode.actionId) {
-            const action = hoveredNode.actionId;
-
-            // Instantly transition to sub-editors choice menu (e.g. VS Code, VS)
-            if (action.startsWith("select_") && (!selectedEditor || selectedEditor !== action.replace("select_", ""))) {
-              selectedEditor = action.replace("select_", "");
-              
-              // Anchor drag reference directly on the new center coordinate
-              draggedAway = false;
-              mouseDownX  = originX;
-              mouseDownY  = originY;
-
-              hoveredNodeIndex = null;
-              expansionPos = 0;
-              targetExpansion = 1;
-              startAnimation();
-              return;
-            }
-
-            // Slide back from selection level back to tools view
-            if (action === "cancel_editor" && selectedEditor) {
-              selectedEditor = null;
-              
-              // Anchor drag reference directly on the new center coordinate
-              draggedAway = false;
-              mouseDownX  = originX;
-              mouseDownY  = originY;
-
-              hoveredNodeIndex = null;
-              expansionPos = 0;
-              targetExpansion = 1;
-              startAnimation();
-              return;
-            }
-
-            // Slide back from Tools back to the Folder directory view
-            if (action === "back") {
-              if (selectedFile) {
-                const ps = pathHistory.pop();
-                if (ps) { currentPath = ps.path; originX = ps.x; originY = ps.y; }
-                selectedFile = null;
-              }
-              showFolderTools = false;
-              
-              // Anchor drag reference directly on the new center coordinate
-              draggedAway = false;
-              mouseDownX  = originX;
-              mouseDownY  = originY;
-
-              hoveredNodeIndex = null;
-              expansionPos = 0;
-              targetExpansion = 1;
-              startAnimation();
-              return;
-            }
-          }
-        }
-      }
-    }
-  });
-
-  canvas.addEventListener("mouseleave", () => {
-    if (hoveredNodeIndex !== null) {
-      hoveredNodeIndex = null;
-      startAnimation();
-    }
-  });
-
-  async function resetToCenter() {
-    currentPath     = START_PATH;
-    originX         = window.innerWidth  / 2;
-    originY         = window.innerHeight / 2;
-    pathHistory     = [];
-    selectedFile    = null;
-    showFolderTools = false;
-    selectedEditor  = null;
-    targetExpansion = 1; // Always open when reset to center
-    expansionPos    = 0;
-    await loadCurrentDirectory();
-  }
-
-  async function hideWindow() {
-    await getCurrentWindow().hide();
-  }
-
-  const appWindow = getCurrentWindow();
-  appWindow.onFocusChanged(({ payload: focused }) => {
-    if (focused) {
-      targetExpansion = 1;
-      startAnimation();
-    }
-  });
-
-  canvas.addEventListener("mousedown", async (e) => {
-    if (isLoadingDir) return; // Prevent any interaction while active directory is fetching
-
-    currentMouseX = e.clientX;
-    currentMouseY = e.clientY;
-
-    const clickedIndex  = getNodeAtPosition(e.clientX, e.clientY, animatedNodes);
-    const clickedAnim   = clickedIndex !== null ? animatedNodes[clickedIndex] : null;
-    const isCenterClick = clickedAnim?.key === "center";
-
-    // Setup drag tracking state
-    isHolding   = true;
-    draggedAway = false;
-    mouseDownX  = e.clientX;
-    mouseDownY  = e.clientY;
-
-    if (expansionPos < 0.85) {
-      if (isCenterClick) {
-        // Tap down to begin hold/reveal on the folder
-        selectedFile    = null;
-        showFolderTools = false;
-        selectedEditor  = null;
-        triggerOpen();
-      } else {
-        // Pressed outside center while collapsed -> hide overlay
-        isHolding = false;
-        await hideWindow();
-      }
-      return;
-    }
-
-    // Clicked completely off-bubble empty space -> keeps open (no action)
-    if (clickedIndex === null) {
-      isHolding = false;
-      return;
-    }
-
-    // If already open and clicked directly on a satellite node (discrete click shortcut)
-    if (clickedAnim && !isCenterClick) {
-      const clickedNode = visibleNodes.find((n, idx) => nodeKey(n, idx) === clickedAnim.key) ?? null;
-      if (clickedNode) {
-        // If clicking on an action bubble, let isHolding remain true so mouseup triggers the event
-        if (clickedNode.isAction) {
-          isHolding = true;
-          return;
-        }
-
-        // Disable hold behaviors on file/directory clicks so quick release behaves normally
-        isHolding = false;
-
-        if (clickedNode.isDir && clickedNode.path && currentPath !== clickedNode.path && !clickedNode.isBack) {
-          pathHistory.push({ path: currentPath, x: originX, y: originY });
-          currentPath = clickedNode.path;
-          const clamped = clampCoordinates(clickedNode.worldX, clickedNode.worldY);
-          originX = clamped.x;
-          originY = clamped.y;
-          
-          draggedAway = false;
-          mouseDownX  = originX;
-          mouseDownY  = originY;
-
-          hoveredNodeIndex = null;
-          expansionPos = 0;
-          targetExpansion = 1;
-          startAnimation();
-          await loadCurrentDirectory();
-          return;
-        }
-
-        if (clickedNode.isBack) {
-          const ps = pathHistory.pop();
-          if (ps) {
-            currentPath = ps.path;
-            originX = ps.x;
-            originY = ps.y;
-          } else {
-            const parent = getParentPath(currentPath);
-            if (parent) {
-              currentPath = parent;
-            } else {
-              currentPath = START_PATH;
-            }
-            const clamped = clampCoordinates(clickedNode.worldX, clickedNode.worldY);
-            originX = clamped.x;
-            originY = clamped.y;
-          }
-
-          draggedAway = false;
-          mouseDownX  = originX;
-          mouseDownY  = originY;
-
-          hoveredNodeIndex = null;
-          expansionPos = 0;
-          targetExpansion = 1;
-          startAnimation();
-          await loadCurrentDirectory();
-          return;
-        }
-
-        if (!clickedNode.isDir && !clickedNode.isAction && clickedNode.path) {
-          pathHistory.push({ path: currentPath, x: originX, y: originY });
-          selectedFile = itemsList.find(i => i.path === clickedNode.path) || null;
-          const clamped = clampCoordinates(clickedNode.worldX, clickedNode.worldY);
-          originX = clamped.x;
-          originY = clamped.y;
-          
-          draggedAway = false;
-          mouseDownX  = originX;
-          mouseDownY  = originY;
-
-          hoveredNodeIndex = null;
-          expansionPos = 0;
-          targetExpansion = 1;
-          startAnimation();
-          return;
-        }
-      }
-    }
-  });
-
-  canvas.addEventListener("mouseup", async () => {
-    if (!isHolding) return;
-    isHolding = false;
-
-    if (isLoadingDir) return; // Ignore releases during fetching
-
-    const releasedIndex = getNodeAtPosition(currentMouseX, currentMouseY, animatedNodes);
-    const releasedAnim  = releasedIndex !== null ? animatedNodes[releasedIndex] : null;
-    const isCenterRelease = releasedAnim?.key === "center";
-
-    // ── Click/Tap on Center bubble (no drag occurred) ───────────────────────────
-    if (isCenterRelease && !draggedAway) {
-      if (selectedEditor) {
-        selectedEditor = null;
-        expansionPos = 0;
-        targetExpansion = 1;
-        startAnimation();
-        return;
-      }
-      if (selectedFile) {
-        const ps = pathHistory.pop();
-        if (ps) { currentPath = ps.path; originX = ps.x; originY = ps.y; }
-        selectedFile = null;
-        expansionPos = 0;
-        targetExpansion = 1;
-        startAnimation();
-        return;
-      }
-      if (showFolderTools) {
-        showFolderTools = false;
-        expansionPos = 0;
-        targetExpansion = 1;
-        startAnimation();
-        return;
-      }
-
-      // Try navigating back through navigation history
-      const ps = pathHistory.pop();
-      if (ps) {
-        currentPath = ps.path;
-        originX = ps.x;
-        originY = ps.y;
-        expansionPos = 0;
-        targetExpansion = 1;
-        startAnimation();
-        await loadCurrentDirectory();
-      } else {
-        // Fallback parent folder resolution
-        const parent = getParentPath(currentPath);
-        if (parent) {
-          currentPath = parent;
-          originX = window.innerWidth / 2;
-          originY = window.innerHeight / 2;
-          expansionPos = 0;
-          targetExpansion = 1;
-          startAnimation();
-          await loadCurrentDirectory();
-        } else {
-          // Already at absolute system root: just refresh listings to keep open
-          startAnimation();
-        }
-      }
-      return;
-    }
-
-    // ── Normal Drag Action / Release Trigger ─────────────────────────────────────
-    if (hoveredNodeIndex !== null && expansionPos > 0.8) {
-      const hoveredAnim = animatedNodes[hoveredNodeIndex];
-      const hoveredNode = visibleNodes.find((n, idx) => nodeKey(n, idx) === hoveredAnim.key);
-
-      if (hoveredNode && hoveredNode.isAction && hoveredNode.actionId) {
-        const action = hoveredNode.actionId;
-
-        if (selectedEditor) {
-          if (action === "cancel_editor") {
-            selectedEditor = null;
-            expansionPos = 0; targetExpansion = 1; startAnimation();
-          } else if (action === "launch_window") {
-            await invoke("launch_editor", { editor: selectedEditor, env: "window", path: getActiveTargetPath() });
-            await resetToCenter();
-          } else if (action === "launch_wsl") {
-            await invoke("launch_editor", { editor: selectedEditor, env: "wsl",    path: getActiveTargetPath() });
-            await resetToCenter();
-          }
-          return;
-        }
-
-        if (showFolderTools) {
-          if (action.startsWith("select_")) {
-            selectedEditor = action.replace("select_", "");
-            expansionPos = 0; targetExpansion = 1; startAnimation();
-          } else if (action === "opencode") {
-            await invoke("open_wsl_opencode", { path: getActiveTargetPath(), prompt: "start" });
-            await resetToCenter();
-          } else if (action === "powershell") {
-            await invoke("open_powershell", { path: currentPath });
-            await resetToCenter();
-          } else if (action === "cmd") {
-            await invoke("open_cmd", { path: currentPath });
-            await resetToCenter();
-          } else if (action === "back") {
-            showFolderTools = false;
-            expansionPos = 0; targetExpansion = 1; startAnimation();
-          }
-          return;
-        }
-
-        if (selectedFile) {
-          if (action.startsWith("select_")) {
-            selectedEditor = action.replace("select_", "");
-            expansionPos = 0; targetExpansion = 1; startAnimation();
-          } else if (action === "opencode") {
-            await invoke("open_wsl_opencode", { path: getActiveTargetPath(), prompt: "start" });
-            await resetToCenter();
-          } else if (action === "back") {
-            const ps = pathHistory.pop();
-            if (ps) { currentPath = ps.path; originX = ps.x; originY = ps.y; }
-            selectedFile = null;
-            expansionPos = 0; targetExpansion = 1; startAnimation();
-          } else if (action === "powershell") {
-            await invoke("open_powershell", { path: selectedFile.path });
-            await resetToCenter();
-          } else if (action === "cmd") {
-            await invoke("open_cmd", { path: selectedFile.path });
-            await resetToCenter();
-          }
-          return;
-        }
-      }
-    }
-
-    // Unhold / Release: triggers direct directory tools if no active child was chosen
-    if (!selectedFile && !selectedEditor && !showFolderTools) {
-      if (draggedAway || hoveredNodeIndex === null || animatedNodes[hoveredNodeIndex]?.key !== "center") {
-        showFolderTools = true;
-        expansionPos = 0;
-        targetExpansion = 1;
-        startAnimation();
-      }
-    }
-  });
-
-  // ── Boot ─────────────────────────────────────────────────────────────────────
-
-  loadCurrentDirectory().then(() => {
-    startAnimation();
-  });
-
-  enable().catch(() => { /* Autostart enabled or unavailable */ });
-});
-</file>
-
 <file path="src-tauri/src/lib.rs">
+mod stats;
+
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -1856,6 +1492,43 @@ fn launch_editor(
     Ok(())
 }
 
+#[tauri::command]
+fn record_navigate(path: String, name: String, is_dir: bool, state: tauri::State<'_, stats::StatsDb>) -> Result<(), String> {
+    state.record_navigate(&path, &name, is_dir)
+}
+
+#[tauri::command]
+fn record_pass_through(path: String, name: String, state: tauri::State<'_, stats::StatsDb>) -> Result<(), String> {
+    state.record_pass_through(&path, &name)
+}
+
+#[tauri::command]
+fn record_select(path: String, name: String, is_dir: bool, state: tauri::State<'_, stats::StatsDb>) -> Result<(), String> {
+    state.record_select(&path, &name, is_dir)
+}
+
+#[tauri::command]
+fn record_tool(
+    tool_name: String,
+    editor_name: Option<String>,
+    env: Option<String>,
+    path: String,
+    name: String,
+    state: tauri::State<'_, stats::StatsDb>,
+) -> Result<(), String> {
+    state.record_tool(&tool_name, editor_name.as_deref(), env.as_deref(), &path, &name)
+}
+
+#[tauri::command]
+fn get_frequent_nodes(limit: i64, state: tauri::State<'_, stats::StatsDb>) -> Result<Vec<stats::NodeStat>, String> {
+    state.get_frequent_nodes(limit)
+}
+
+#[tauri::command]
+fn get_frequent_tools(limit: i64, state: tauri::State<'_, stats::StatsDb>) -> Result<Vec<stats::ToolStat>, String> {
+    state.get_frequent_tools(limit)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     dotenvy::dotenv().ok();
@@ -1882,6 +1555,13 @@ pub fn run() {
                 }
             })?;
 
+            if let Ok(app_data_dir) = app.path().app_data_dir() {
+                let db_path = app_data_dir.join("stats.db");
+                if let Ok(s) = stats::StatsDb::new(db_path) {
+                    app.manage(s);
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1890,11 +1570,616 @@ pub fn run() {
             open_cmd,
             open_vscode,
             open_wsl_opencode,
-            launch_editor
+            launch_editor,
+            record_navigate,
+            record_pass_through,
+            record_select,
+            record_tool,
+            get_frequent_nodes,
+            get_frequent_tools
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+</file>
+
+<file path="src/main.ts">
+import { invoke } from "@tauri-apps/api/core";
+import { enable } from "@tauri-apps/plugin-autostart";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+
+import { FileItem, HistoryState, RenderNode, AnimatedNode } from "./types";
+import { 
+  START_PATH, 
+  EXPAND_RATE, 
+  COLLAPSE_RATE, 
+  NODE_MOVE_RATE, 
+  NODE_ALPHA_RATE, 
+  NODE_RAD_RATE, 
+  NODE_EXIT_RATE, 
+  POS_SNAP, 
+  ALPHA_SNAP, 
+  RAD_SNAP 
+} from "./config";
+import { 
+  lerpSnap, 
+  getParentPath, 
+  getNodeAtPosition, 
+  clampCoordinates, 
+  nodeKey 
+} from "./utils";
+import { drawBubble, drawConnection, drawLabel } from "./renderer";
+import { calculateLayout } from "./layout";
+
+let currentPath = START_PATH;
+let itemsList: FileItem[] = [];
+let selectedFile: FileItem | null = null;
+
+let showFolderTools = false;
+let selectedEditor: string | null = null;
+
+let originX = window.innerWidth / 2;
+let originY = window.innerHeight / 2;
+
+let expansionPos    = 0;
+let targetExpansion = 1;
+
+let lastFrameTime = 0;
+let isAnimating = false;
+
+let isHolding   = false;
+let draggedAway = false;
+let mouseDownX  = 0;
+let mouseDownY  = 0;
+
+let isLoadingDir = false;
+
+let currentMouseX = window.innerWidth / 2;
+let currentMouseY = window.innerHeight / 2;
+
+let pathHistory: HistoryState[] = [];
+let hoveredNodeIndex: number | null = null;
+
+let visibleNodes: RenderNode[] = [];
+let animatedNodes: AnimatedNode[] = [];
+
+let justExitedPath: string | null = null;
+let justExitedX: number | null = null;
+let justExitedY: number | null = null;
+
+function getActiveTargetPath(): string {
+  return selectedFile ? selectedFile.path : currentPath;
+}
+
+
+function syncAnimatedNodes(dt: number): boolean {
+  let moving = false;
+  const usedKeys = new Set<string>();
+
+  visibleNodes.forEach((node, index) => {
+    const key = nodeKey(node, index);
+    usedKeys.add(key);
+
+    let anim = animatedNodes.find((a) => a.key === "center");
+    if (index !== 0 || !anim) {
+      anim = animatedNodes.find((a) => a.key === key);
+    }
+    
+    if (!anim) {
+      const isCenter = index === 0;
+      const centerAnim = animatedNodes.find(a => a.key === "center");
+      anim = {
+        ...node, key,
+        curX:      isCenter ? node.worldX : (centerAnim ? centerAnim.curX : originX),
+        curY:      isCenter ? node.worldY : (centerAnim ? centerAnim.curY : originY),
+        curRadius: isCenter ? node.radius : 0,
+        curAlpha:  isCenter ? 1 : 0,
+      };
+      animatedNodes.push(anim);
+    }
+
+    anim.label     = node.label;
+    anim.isDir     = node.isDir;
+    anim.isAction  = node.isAction;
+    anim.isBack    = node.isBack;
+    anim.actionId  = node.actionId;
+    anim.path      = node.path;
+    anim.worldX    = node.worldX;
+    anim.worldY    = node.worldY;
+    anim.radius    = node.radius;
+    anim.baseColor = node.baseColor;
+
+    const tgtAlpha = index === 0 ? 1 : expansionPos;
+
+    const newX = lerpSnap(anim.curX,      anim.worldX, NODE_MOVE_RATE,  dt, POS_SNAP);
+    const newY = lerpSnap(anim.curY,      anim.worldY, NODE_MOVE_RATE,  dt, POS_SNAP);
+    const newR = lerpSnap(anim.curRadius, anim.radius, NODE_RAD_RATE,   dt, RAD_SNAP);
+    const newA = lerpSnap(anim.curAlpha,  tgtAlpha,    NODE_ALPHA_RATE, dt, ALPHA_SNAP);
+
+    if (newX !== anim.curX || newY !== anim.curY || newR !== anim.curRadius || newA !== anim.curAlpha)
+      moving = true;
+
+    anim.curX = newX; anim.curY = newY; anim.curRadius = newR; anim.curAlpha = newA;
+  });
+
+  animatedNodes = animatedNodes.filter((a) => {
+    if (usedKeys.has(a.key)) return true;
+    if (a.baseColor === "#f1c40f" && a.path !== justExitedPath) return false;
+    const newX = lerpSnap(a.curX,      originX, NODE_EXIT_RATE, dt, POS_SNAP);
+    const newY = lerpSnap(a.curY,      originY, NODE_EXIT_RATE, dt, POS_SNAP);
+    const newR = lerpSnap(a.curRadius, 0,       NODE_EXIT_RATE, dt, RAD_SNAP);
+    const newA = lerpSnap(a.curAlpha,  0,       NODE_EXIT_RATE, dt, ALPHA_SNAP);
+    if (newX !== a.curX || newY !== a.curY || newR !== a.curRadius || newA !== a.curAlpha) moving = true;
+    a.curX = newX; a.curY = newY; a.curRadius = newR; a.curAlpha = newA;
+    return a.curRadius > RAD_SNAP || a.curAlpha > ALPHA_SNAP;
+  });
+
+  animatedNodes.sort((a, b) => {
+    if (a.key === "center") return -1;
+    if (b.key === "center") return 1;
+    return 0;
+  });
+
+  return moving;
+}
+
+window.addEventListener("DOMContentLoaded", () => {
+  const canvas = document.getElementById("bubble-canvas") as HTMLCanvasElement;
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+
+  function resizeCanvas() {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width  = window.innerWidth  * dpr;
+    canvas.height = window.innerHeight * dpr;
+    canvas.style.width  = `${window.innerWidth}px`;
+    canvas.style.height = `${window.innerHeight}px`;
+    ctx!.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (!showFolderTools && !selectedFile) {
+      originX = window.innerWidth  / 2;
+      originY = window.innerHeight / 2;
+    }
+  }
+  window.addEventListener("resize", resizeCanvas);
+  resizeCanvas();
+
+  async function loadCurrentDirectory() {
+    if (isLoadingDir) return;
+    isLoadingDir = true;
+    try {
+      itemsList = await invoke("read_directory", { path: currentPath });
+      selectedFile = null;
+      startAnimation();
+    } catch (err) {
+      console.error("Failed to load path:", err);
+    } finally {
+      isLoadingDir = false;
+    }
+  }
+
+  function startAnimation() {
+    if (isAnimating) return;
+    isAnimating   = true;
+    lastFrameTime = 0;
+    requestAnimationFrame(draw);
+  }
+
+  function triggerOpen() {
+    expansionPos    = 0;
+    targetExpansion = 1;
+    startAnimation();
+  }
+
+  function draw(timestamp: number) {
+    const dt = lastFrameTime
+      ? Math.min((timestamp - lastFrameTime) / (1000 / 60), 3)
+      : 1;
+    lastFrameTime = timestamp;
+
+    ctx!.clearRect(0, 0, window.innerWidth, window.innerHeight);
+
+    const rate = targetExpansion > expansionPos ? EXPAND_RATE : COLLAPSE_RATE;
+    expansionPos = lerpSnap(expansionPos, targetExpansion, rate, dt, 0.002);
+    const expansionSettled = expansionPos === targetExpansion;
+
+    visibleNodes = calculateLayout(
+      currentPath,
+      selectedFile,
+      selectedEditor,
+      showFolderTools,
+      originX,
+      originY,
+      expansionPos,
+      pathHistory,
+      itemsList,
+      justExitedPath,
+      justExitedX,
+      justExitedY
+    );
+    const nodesMoving = syncAnimatedNodes(dt);
+
+    const centerNode = animatedNodes.find(a => a.key === "center");
+    animatedNodes.forEach((node) => {
+      if (node.key === "center" || !centerNode) return;
+      const isHov = hoveredNodeIndex !== null
+        && animatedNodes[hoveredNodeIndex]?.key === node.key
+        && expansionPos > 0.85;
+      drawConnection(ctx!, centerNode.curX, centerNode.curY, node.curX, node.curY, node.curAlpha, isHov);
+    });
+
+    animatedNodes.forEach((node) => {
+      const isCenter = node.key === "center";
+      const isHov    = hoveredNodeIndex !== null
+        && animatedNodes[hoveredNodeIndex]?.key === node.key
+        && expansionPos > 0.85;
+      const alpha = isCenter ? 1 : node.curAlpha;
+      drawBubble(ctx!, node.curX, node.curY, node.curRadius, node.baseColor, alpha, isHov);
+      drawLabel(ctx!, node.label, node.curX, node.curY, node.curRadius, alpha, isCenter);
+    });
+
+    if (isHolding) {
+      const cn = animatedNodes.find(a => a.key === "center");
+      if (cn) {
+        const hov = hoveredNodeIndex !== null ? animatedNodes[hoveredNodeIndex] : null;
+        const ax = hov && hov.key !== "center" ? hov.curX : cn.curX;
+        const ay = hov && hov.key !== "center" ? hov.curY : cn.curY;
+        const ar = hov && hov.key !== "center" ? hov.curRadius : cn.curRadius;
+        const dx = currentMouseX - ax;
+        const dy = currentMouseY - ay;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const pad = ar + 4;
+        const sx = dist > pad ? ax + (dx / dist) * pad : ax;
+        const sy = dist > pad ? ay + (dy / dist) * pad : ay;
+        drawConnection(ctx!, sx, sy, currentMouseX, currentMouseY, 1, true);
+      }
+    }
+
+    if (expansionSettled && !nodesMoving && !isHolding) {
+      isAnimating = false;
+      return;
+    }
+
+    requestAnimationFrame(draw);
+  }
+
+  // ── helpers shared by mousedown and mousemove back-navigation ──────────────
+
+  function doNavigateDown(node: RenderNode & { path: string }, label: string) {
+    const animNode = animatedNodes.find(a => a.path === node.path);
+    const absX = animNode ? animNode.curX : node.worldX;
+    const absY = animNode ? animNode.curY : node.worldY;
+    // Store as offset relative to current origin, so on the way back we can
+    // reconstruct the exact same screen position regardless of where originX/Y ends up.
+    const exitX = absX - originX;
+    const exitY = absY - originY;
+
+    pathHistory.push({ path: currentPath, x: originX, y: originY, exitX, exitY });
+    currentPath = node.path;
+    invoke("record_navigate", { path: currentPath, name: label, isDir: true }).catch(() => {});
+    const clamped = clampCoordinates(node.worldX, node.worldY);
+    originX = clamped.x;
+    originY = clamped.y;
+    justExitedPath = null;
+    justExitedX    = null;
+    justExitedY    = null;
+  }
+
+  function doNavigateBack(backNodeWorldX: number, backNodeWorldY: number) {
+    invoke("record_pass_through", { path: currentPath, name: visibleNodes[0]?.label || "" }).catch(() => {});
+
+    const ps = pathHistory.pop();
+    const clamped = clampCoordinates(backNodeWorldX, backNodeWorldY);
+    originX = clamped.x;
+    originY = clamped.y;
+
+    justExitedPath = currentPath;
+    if (ps) {
+      // exitX/Y is stored as an offset from ps.x/y (the parent's origin).
+      // Reconstruct absolute canvas position using the stored parent origin.
+      justExitedX = ps.x + ps.exitX;
+      justExitedY = ps.y + ps.exitY;
+      currentPath = ps.path;
+    } else {
+      justExitedX = null;
+      justExitedY = null;
+      const parent = getParentPath(currentPath);
+      currentPath = parent ?? START_PATH;
+    }
+  }
+
+  // ── mousemove ─────────────────────────────────────────────────────────────
+
+  canvas.addEventListener("mousemove", async (e) => {
+    currentMouseX = e.clientX;
+    currentMouseY = e.clientY;
+
+    const prev = hoveredNodeIndex;
+    hoveredNodeIndex = getNodeAtPosition(e.clientX, e.clientY, animatedNodes);
+    canvas.style.cursor = hoveredNodeIndex !== null ? "pointer" : "default";
+    if (prev !== hoveredNodeIndex) startAnimation();
+
+    if (isLoadingDir) return;
+
+    if (isHolding) {
+      const dx = e.clientX - mouseDownX;
+      const dy = e.clientY - mouseDownY;
+      if (dx * dx + dy * dy > 25 * 25) draggedAway = true;
+
+      if (draggedAway && hoveredNodeIndex !== null && expansionPos > 0.8) {
+        const hoveredAnim = animatedNodes[hoveredNodeIndex];
+        const hoveredNode = visibleNodes.find((n, idx) => nodeKey(n, idx) === hoveredAnim.key);
+
+        if (hoveredNode && hoveredAnim.key !== "center") {
+
+          // 1) Navigate down into folder
+          if (hoveredNode.isDir && hoveredNode.path && currentPath !== hoveredNode.path && !hoveredNode.isBack) {
+            doNavigateDown(hoveredNode as RenderNode & { path: string }, hoveredNode.label);
+            draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+            hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
+            startAnimation();
+            await loadCurrentDirectory();
+            return;
+          }
+
+          // 2) cd .. back
+          if (hoveredNode.isBack) {
+            doNavigateBack(hoveredNode.worldX, hoveredNode.worldY);
+            draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+            hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
+            startAnimation();
+            await loadCurrentDirectory();
+            return;
+          }
+
+          // 3) File selected
+          if (!hoveredNode.isDir && !hoveredNode.isAction && hoveredNode.path && (!selectedFile || selectedFile.path !== hoveredNode.path)) {
+            pathHistory.push({ path: currentPath, x: originX, y: originY });
+            selectedFile = itemsList.find(i => i.path === hoveredNode.path) || null;
+            invoke("record_select", { path: hoveredNode.path, name: hoveredNode.label, isDir: false }).catch(() => {});
+            const clamped = clampCoordinates(hoveredNode.worldX, hoveredNode.worldY);
+            originX = clamped.x; originY = clamped.y;
+            draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+            hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
+            startAnimation();
+            return;
+          }
+
+          // 4) Action sub-menu
+          if (hoveredNode.isAction && hoveredNode.actionId) {
+            const action = hoveredNode.actionId;
+
+            if (action.startsWith("select_") && (!selectedEditor || selectedEditor !== action.replace("select_", ""))) {
+              selectedEditor = action.replace("select_", "");
+              draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+              hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
+              startAnimation(); return;
+            }
+            if (action === "cancel_editor" && selectedEditor) {
+              selectedEditor = null;
+              draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+              hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
+              startAnimation(); return;
+            }
+            if (action === "back") {
+              if (selectedFile) {
+                const ps = pathHistory.pop();
+                if (ps) { currentPath = ps.path; originX = ps.x; originY = ps.y; }
+                selectedFile = null;
+              }
+              showFolderTools = false;
+              draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+              hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
+              startAnimation(); return;
+            }
+          }
+        }
+      }
+    }
+  });
+
+  canvas.addEventListener("mouseleave", () => {
+    if (hoveredNodeIndex !== null) { hoveredNodeIndex = null; startAnimation(); }
+  });
+
+  async function hideWindow() { await getCurrentWindow().hide(); }
+
+  const appWindow = getCurrentWindow();
+  appWindow.onFocusChanged(({ payload: focused }) => {
+    if (focused) { targetExpansion = 1; startAnimation(); }
+  });
+
+  // ── mousedown ─────────────────────────────────────────────────────────────
+
+  canvas.addEventListener("mousedown", async (e) => {
+    if (isLoadingDir) return;
+    currentMouseX = e.clientX; currentMouseY = e.clientY;
+
+    const clickedIndex  = getNodeAtPosition(e.clientX, e.clientY, animatedNodes);
+    const clickedAnim   = clickedIndex !== null ? animatedNodes[clickedIndex] : null;
+    const isCenterClick = clickedAnim?.key === "center";
+
+    isHolding = true; draggedAway = false;
+    mouseDownX = e.clientX; mouseDownY = e.clientY;
+
+    if (expansionPos < 0.85) {
+      if (isCenterClick) {
+        selectedFile = null; showFolderTools = false; selectedEditor = null;
+        triggerOpen();
+      } else {
+        isHolding = false;
+        await hideWindow();
+      }
+      return;
+    }
+
+    if (clickedIndex === null) { isHolding = false; return; }
+
+    if (clickedAnim && !isCenterClick) {
+      const clickedNode = visibleNodes.find((n, idx) => nodeKey(n, idx) === clickedAnim.key) ?? null;
+      if (clickedNode) {
+        if (clickedNode.isAction) { isHolding = true; return; }
+        isHolding = false;
+
+        // Click: navigate down
+        if (clickedNode.isDir && clickedNode.path && currentPath !== clickedNode.path && !clickedNode.isBack) {
+          doNavigateDown(clickedNode as RenderNode & { path: string }, clickedNode.label);
+          draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+          hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
+          startAnimation();
+          await loadCurrentDirectory();
+          return;
+        }
+
+        // Click: navigate up
+        if (clickedNode.isBack) {
+          doNavigateBack(clickedNode.worldX, clickedNode.worldY);
+          draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+          hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
+          startAnimation();
+          await loadCurrentDirectory();
+          return;
+        }
+
+        // Click: select file
+        if (!clickedNode.isDir && !clickedNode.isAction && clickedNode.path) {
+          pathHistory.push({ path: currentPath, x: originX, y: originY });
+          selectedFile = itemsList.find(i => i.path === clickedNode.path) || null;
+          invoke("record_select", { path: clickedNode.path, name: clickedNode.label, isDir: false }).catch(() => {});
+          const clamped = clampCoordinates(clickedNode.worldX, clickedNode.worldY);
+          originX = clamped.x; originY = clamped.y;
+          draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+          hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
+          startAnimation(); return;
+        }
+      }
+    }
+  });
+
+  // ── mouseup ───────────────────────────────────────────────────────────────
+
+  canvas.addEventListener("mouseup", async () => {
+    if (!isHolding) return;
+    isHolding = false;
+    if (isLoadingDir) return;
+
+    const releasedIndex   = getNodeAtPosition(currentMouseX, currentMouseY, animatedNodes);
+    const releasedAnim    = releasedIndex !== null ? animatedNodes[releasedIndex] : null;
+    const isCenterRelease = releasedAnim?.key === "center";
+
+    // Center click: navigate up shortcut
+    if (isCenterRelease && !draggedAway) {
+      if (selectedEditor) {
+        selectedEditor = null; expansionPos = 0; targetExpansion = 1; startAnimation(); return;
+      }
+      if (selectedFile) {
+        const ps = pathHistory.pop();
+        if (ps) { currentPath = ps.path; originX = ps.x; originY = ps.y; }
+        selectedFile = null; expansionPos = 0; targetExpansion = 1; startAnimation(); return;
+      }
+      if (showFolderTools) {
+        showFolderTools = false; expansionPos = 0; targetExpansion = 1; startAnimation(); return;
+      }
+
+      const ps = pathHistory.pop();
+      if (ps) {
+        const backNode = visibleNodes.find(n => n.isBack);
+        const backWorldX = backNode ? backNode.worldX : ps.x;
+        const backWorldY = backNode ? backNode.worldY : ps.y;
+        doNavigateBack(backWorldX, backWorldY);
+        expansionPos = 0; targetExpansion = 1;
+        startAnimation();
+        await loadCurrentDirectory();
+      } else {
+        const parent = getParentPath(currentPath);
+        if (parent) {
+          const backNode = visibleNodes.find(n => n.isBack);
+          const backWorldX = backNode ? backNode.worldX : window.innerWidth / 2;
+          const backWorldY = backNode ? backNode.worldY : window.innerHeight / 2;
+          doNavigateBack(backWorldX, backWorldY);
+          expansionPos = 0; targetExpansion = 1;
+          startAnimation();
+          await loadCurrentDirectory();
+        } else {
+          startAnimation();
+        }
+      }
+      return;
+    }
+
+    if (hoveredNodeIndex !== null && expansionPos > 0.8) {
+      const hoveredAnim = animatedNodes[hoveredNodeIndex];
+      const hoveredNode = visibleNodes.find((n, idx) => nodeKey(n, idx) === hoveredAnim.key);
+
+      if (hoveredNode && hoveredNode.isAction && hoveredNode.actionId) {
+        const action  = hoveredNode.actionId;
+        const curName = currentPath.split(/[\\/]/).pop() || currentPath;
+
+        if (selectedEditor) {
+          if (action === "cancel_editor") {
+            selectedEditor = null; expansionPos = 0; targetExpansion = 1; startAnimation();
+          } else if (action === "launch_window") {
+            invoke("record_tool", { toolName: selectedEditor, editorName: selectedEditor, env: "window", path: getActiveTargetPath(), name: curName }).catch(() => {});
+            await invoke("launch_editor", { editor: selectedEditor, env: "window", path: getActiveTargetPath() });
+            await hideWindow();
+          } else if (action === "launch_wsl") {
+            invoke("record_tool", { toolName: selectedEditor, editorName: selectedEditor, env: "wsl", path: getActiveTargetPath(), name: curName }).catch(() => {});
+            await invoke("launch_editor", { editor: selectedEditor, env: "wsl", path: getActiveTargetPath() });
+            await hideWindow();
+          }
+          return;
+        }
+
+        if (showFolderTools) {
+          if (action.startsWith("select_")) {
+            selectedEditor = action.replace("select_", ""); expansionPos = 0; targetExpansion = 1; startAnimation();
+          } else if (action === "opencode") {
+            invoke("record_tool", { toolName: "opencode", editorName: null, env: null, path: currentPath, name: curName }).catch(() => {});
+            await invoke("open_wsl_opencode", { path: getActiveTargetPath(), prompt: "start" }); await hideWindow();
+          } else if (action === "powershell") {
+            invoke("record_tool", { toolName: "powershell", editorName: null, env: null, path: currentPath, name: curName }).catch(() => {});
+            await invoke("open_powershell", { path: currentPath }); await hideWindow();
+          } else if (action === "cmd") {
+            invoke("record_tool", { toolName: "cmd", editorName: null, env: null, path: currentPath, name: curName }).catch(() => {});
+            await invoke("open_cmd", { path: currentPath }); await hideWindow();
+          } else if (action === "back") {
+            showFolderTools = false; expansionPos = 0; targetExpansion = 1; startAnimation();
+          }
+          return;
+        }
+
+        if (selectedFile) {
+          if (action.startsWith("select_")) {
+            selectedEditor = action.replace("select_", ""); expansionPos = 0; targetExpansion = 1; startAnimation();
+          } else if (action === "opencode") {
+            invoke("record_tool", { toolName: "opencode", editorName: null, env: null, path: selectedFile.path, name: selectedFile.name }).catch(() => {});
+            await invoke("open_wsl_opencode", { path: getActiveTargetPath(), prompt: "start" }); await hideWindow();
+          } else if (action === "back") {
+            const ps = pathHistory.pop();
+            if (ps) { currentPath = ps.path; originX = ps.x; originY = ps.y; }
+            selectedFile = null; expansionPos = 0; targetExpansion = 1; startAnimation();
+          } else if (action === "powershell") {
+            invoke("record_tool", { toolName: "powershell", editorName: null, env: null, path: selectedFile.path, name: selectedFile.name }).catch(() => {});
+            await invoke("open_powershell", { path: selectedFile.path }); await hideWindow();
+          } else if (action === "cmd") {
+            invoke("record_tool", { toolName: "cmd", editorName: null, env: null, path: selectedFile.path, name: selectedFile.name }).catch(() => {});
+            await invoke("open_cmd", { path: selectedFile.path }); await hideWindow();
+          }
+          return;
+        }
+      }
+    }
+
+    if (!selectedFile && !selectedEditor && !showFolderTools) {
+      if (draggedAway || hoveredNodeIndex === null || animatedNodes[hoveredNodeIndex]?.key !== "center") {
+        showFolderTools = true; expansionPos = 0; targetExpansion = 1; startAnimation();
+      }
+    }
+  });
+
+  loadCurrentDirectory().then(() => { startAnimation(); });
+  enable().catch(() => {});
+});
 </file>
 
 </files>
