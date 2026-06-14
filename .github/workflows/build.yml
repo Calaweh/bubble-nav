@@ -1,14 +1,9 @@
-name: Build
+name: Build Windows Release
 
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
-
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
+  workflow_dispatch:
 
 jobs:
   build:
@@ -17,37 +12,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Rust (Windows MSVC)
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
         with:
-          targets: x86_64-pc-windows-msvc
+          node-version: "22"
 
-      - name: Cache Rust dependencies
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Install npm dependencies
+      - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build frontend
-        run: npm run build
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Build Tauri app (Windows)
-        run: npm run tauri build
-        env:
-          TAURI_PRIVATE_KEY: ""
-          TAURI_PASSWORD: ""
+      - name: Build Tauri (release)
+        run: npx tauri build
 
-      - name: Upload installer artifact
+      - name: Upload exe artifact
         uses: actions/upload-artifact@v4
         with:
           name: bubble-nav-windows
-          path: src-tauri/target/release/bubble-nav.exe
-          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bubble-nav.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: warn
