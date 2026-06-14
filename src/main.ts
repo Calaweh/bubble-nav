@@ -353,7 +353,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
           // 3) File selected
           if (!hoveredNode.isDir && !hoveredNode.isAction && hoveredNode.path && (!selectedFile || selectedFile.path !== hoveredNode.path)) {
-            pathHistory.push({ path: currentPath, x: originX, y: originY });
+            pathHistory.push({ path: currentPath, x: originX, y: originY, exitX: 0, exitY: 0 });
             selectedFile = itemsList.find(i => i.path === hoveredNode.path) || null;
             invoke("record_select", { path: hoveredNode.path, name: hoveredNode.label, isDir: false }).catch(() => {});
             const clamped = clampCoordinates(hoveredNode.worldX, hoveredNode.worldY);
@@ -462,7 +462,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
         // Click: select file
         if (!clickedNode.isDir && !clickedNode.isAction && clickedNode.path) {
-          pathHistory.push({ path: currentPath, x: originX, y: originY });
+          pathHistory.push({ path: currentPath, x: originX, y: originY, exitX: 0, exitY: 0 });
           selectedFile = itemsList.find(i => i.path === clickedNode.path) || null;
           invoke("record_select", { path: clickedNode.path, name: clickedNode.label, isDir: false }).catch(() => {});
           const clamped = clampCoordinates(clickedNode.worldX, clickedNode.worldY);
@@ -571,18 +571,18 @@ window.addEventListener("DOMContentLoaded", () => {
           if (action.startsWith("select_")) {
             selectedEditor = action.replace("select_", ""); expansionPos = 0; targetExpansion = 1; startAnimation();
           } else if (action === "opencode") {
-            invoke("record_tool", { toolName: "opencode", editorName: null, env: null, path: selectedFile.path, name: selectedFile.name }).catch(() => {});
-            await invoke("open_wsl_opencode", { path: getActiveTargetPath(), prompt: "start" }); await hideWindow();
+            invoke("record_tool", { toolName: "opencode", editorName: null, env: null, path: currentPath, name: curName }).catch(() => {});
+            await invoke("open_wsl_opencode", { path: currentPath, prompt: "start" }); await hideWindow();
           } else if (action === "back") {
             const ps = pathHistory.pop();
             if (ps) { currentPath = ps.path; originX = ps.x; originY = ps.y; }
             selectedFile = null; expansionPos = 0; targetExpansion = 1; startAnimation();
           } else if (action === "powershell") {
-            invoke("record_tool", { toolName: "powershell", editorName: null, env: null, path: selectedFile.path, name: selectedFile.name }).catch(() => {});
-            await invoke("open_powershell", { path: selectedFile.path }); await hideWindow();
+            invoke("record_tool", { toolName: "powershell", editorName: null, env: null, path: currentPath, name: curName }).catch(() => {});
+            await invoke("open_powershell", { path: currentPath }); await hideWindow();
           } else if (action === "cmd") {
-            invoke("record_tool", { toolName: "cmd", editorName: null, env: null, path: selectedFile.path, name: selectedFile.name }).catch(() => {});
-            await invoke("open_cmd", { path: selectedFile.path }); await hideWindow();
+            invoke("record_tool", { toolName: "cmd", editorName: null, env: null, path: currentPath, name: curName }).catch(() => {});
+            await invoke("open_cmd", { path: currentPath }); await hideWindow();
           }
           return;
         }
