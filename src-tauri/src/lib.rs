@@ -103,9 +103,35 @@ fn read_directory(path: String) -> Result<Vec<FileItem>, String> {
 #[tauri::command]
 fn open_powershell(app: tauri::AppHandle, path: String) -> Result<(), String> {
     Command::new("powershell.exe")
-        .args(&["-NoExit", "-Command", &format!("Set-Location -LiteralPath \"{}\"", path.replace('"', "`\""))])
+        .args(&[
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Start-Process powershell.exe -ArgumentList '-NoExit -Command Set-Location -LiteralPath \"{}\"'",
+                path.replace('"', "`\"")
+            ),
+        ])
         .spawn()
         .map_err(|e| e.to_string())?;
+    hide_window(&app);
+    Ok(())
+}
+
+#[tauri::command]
+fn open_wsl(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let (distro, unix_path) = get_wsl_distro_and_unix_path(&path);
+
+    let wt_result = Command::new("wt.exe")
+        .args(&["new-tab", "--", "wsl.exe", "-d", &distro, "--", "bash", "-c", &format!("cd '{}' && exec bash", unix_path.replace('\'', "'\\''"))])
+        .spawn();
+
+    if wt_result.is_err() {
+        Command::new("cmd.exe")
+            .args(&["/C", "start", "WSL", "wsl.exe", "-d", &distro, "--", "bash", "-c", &format!("cd '{}' && exec bash", unix_path.replace('\'', "'\\''"))])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
     hide_window(&app);
     Ok(())
 }
@@ -113,16 +139,56 @@ fn open_powershell(app: tauri::AppHandle, path: String) -> Result<(), String> {
 #[tauri::command]
 fn open_cmd(app: tauri::AppHandle, path: String) -> Result<(), String> {
     Command::new("cmd.exe")
-        .args(&["/K", "cd", "/d", &format!("\"{}\"", path)])
+        .args(&[
+            "/C",
+            "start",
+            "cmd.exe",
+            "/K",
+            &format!("cd /d \"{}\"", path),
+        ])
         .spawn()
         .map_err(|e| e.to_string())?;
     hide_window(&app);
     Ok(())
 }
 
+fn resolve_vscode() -> String {
+    if let Ok(val) = env::var("VSCODE_BIN") {
+        if val != "code" { return val; }
+    }
+    if let Ok(local) = env::var("LOCALAPPDATA") {
+        let p = Path::new(&local).join(r"Programs\Microsoft VS Code\Code.exe");
+        if p.exists() { return p.to_string_lossy().to_string(); }
+    }
+    let sys = Path::new(r"C:\Program Files\Microsoft VS Code\Code.exe");
+    if sys.exists() { return sys.to_string_lossy().to_string(); }
+    "code".to_string()
+}
+
+fn resolve_antigravity() -> String {
+    if let Ok(val) = env::var("ANTIGRAVITY_PATH") { return val; }
+    if let Ok(home) = env::var("USERPROFILE") {
+        let p = Path::new(&home)
+            .join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Antigravity IDE\Antigravity.exe");
+        if p.exists() { return p.to_string_lossy().to_string(); }
+    }
+    let candidates: [&str; 5] = [
+        r"C:\Users\User\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Antigravity IDE\Antigravity.exe",
+        r"D:\Program Files\Antigravity IDE\Antigravity IDE.exe",
+        r"C:\Program Files\Antigravity IDE\Antigravity IDE.exe",
+        r"C:\Program Files\Antigravity IDE\Antigravity.exe",
+        "antigravity",
+    ];
+    for c in &candidates {
+        let p = Path::new(c);
+        if p.exists() { return p.to_string_lossy().to_string(); }
+    }
+    candidates[0].to_string()
+}
+
 #[tauri::command]
 fn open_vscode(app: tauri::AppHandle, path: String) -> Result<(), String> {
-    let vscode_bin = env::var("VSCODE_BIN").unwrap_or_else(|_| "code".to_string());
+    let vscode_bin = resolve_vscode();
     if path.starts_with(r"\\wsl.localhost\") || path.starts_with(r"\\wsl$\") {
         let clean_path = path
             .replace(r"\\wsl.localhost\", "")
@@ -132,8 +198,8 @@ fn open_vscode(app: tauri::AppHandle, path: String) -> Result<(), String> {
             let unix_path = format!("/{}", internal.replace('\\', "/"));
             let uri = format!("vscode-remote://wsl+{}{}", distro, unix_path);
 
-            Command::new("cmd.exe")
-                .args(&["/C", &vscode_bin, "--folder-uri", &uri])
+            Command::new(&vscode_bin)
+                .args(&["--folder-uri", &uri])
                 .spawn()
                 .map_err(|e| e.to_string())?;
             hide_window(&app);
@@ -141,8 +207,8 @@ fn open_vscode(app: tauri::AppHandle, path: String) -> Result<(), String> {
         }
     }
 
-    Command::new("cmd.exe")
-        .args(&["/C", &vscode_bin, &format!("\"{}\"", path)])
+    Command::new(&vscode_bin)
+        .arg(&path)
         .spawn()
         .map_err(|e| e.to_string())?;
     hide_window(&app);
@@ -219,9 +285,9 @@ fn launch_editor(
     env: String,
     path: String,
 ) -> Result<(), String> {
-    let vscode_bin = env::var("VSCODE_BIN").unwrap_or_else(|_| "code".to_string());
-    let antigravity_bin = env::var("ANTIGRAVITY_PATH").unwrap_or_default();
-    let visualstudio_bin = env::var("VISUALSTUDIO_PATH").unwrap_or_default();
+    let vscode_bin = resolve_vscode();
+    let antigravity_bin = resolve_antigravity();
+    let visualstudio_bin = env::var("VISUALSTUDIO_PATH").unwrap_or_else(|_| r"C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\devenv.exe".to_string());
 
     if env == "wsl" {
         let (distro, unix_path) = get_wsl_distro_and_unix_path(&path);
@@ -229,8 +295,8 @@ fn launch_editor(
         match editor.as_str() {
             "vscode" => {
                 let uri = format!("vscode-remote://wsl+{}{}", distro, unix_path);
-                Command::new("cmd.exe")
-                    .args(&["/C", &vscode_bin, "--folder-uri", &uri])
+                Command::new(&vscode_bin)
+                    .args(&["--folder-uri", &uri])
                     .spawn()
                     .map_err(|e| e.to_string())?;
             }
@@ -252,8 +318,8 @@ fn launch_editor(
     } else {
         match editor.as_str() {
             "vscode" => {
-                Command::new("cmd.exe")
-                    .args(&["/C", &vscode_bin, &format!("\"{}\"", path)])
+                Command::new(&vscode_bin)
+                    .arg(&path)
                     .spawn()
                     .map_err(|e| e.to_string())?;
             }
@@ -314,9 +380,26 @@ fn get_frequent_tools(limit: i64, state: tauri::State<'_, stats::StatsDb>) -> Re
     state.get_frequent_tools(limit)
 }
 
+fn load_env() {
+    if let Ok(exe) = std::env::current_exe() {
+        let mut root = exe.parent();
+        for _ in 0..3 {
+            root = root.and_then(|p| p.parent());
+        }
+        if let Some(dir) = root {
+            let candidate = dir.join(".env");
+            if candidate.exists() {
+                dotenvy::from_path(candidate).ok();
+                return;
+            }
+        }
+    }
+    dotenvy::dotenv().ok();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    dotenvy::dotenv().ok();
+    load_env();
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
@@ -340,12 +423,20 @@ pub fn run() {
                 }
             })?;
 
-            if let Ok(app_data_dir) = app.path().app_data_dir() {
-                let db_path = app_data_dir.join("stats.db");
-                if let Ok(s) = stats::StatsDb::new(db_path) {
-                    app.manage(s);
-                }
-            }
+            let stats_db = app.path().app_data_dir()
+                .map(|d| d.join("stats.db"))
+                .ok()
+                .and_then(|p| stats::StatsDb::new(p).ok())
+                .or_else(|| {
+                    let tmp = std::env::temp_dir().join("bubble-nav-stats.db");
+                    stats::StatsDb::new(tmp).ok()
+                })
+                .unwrap_or_else(|| {
+                    let conn = rusqlite::Connection::open_in_memory()
+                        .expect("Failed to create in-memory DB");
+                    stats::StatsDb::with_connection(conn)
+                });
+            app.manage(stats_db);
 
             Ok(())
         })
@@ -353,6 +444,7 @@ pub fn run() {
             read_directory,
             open_powershell,
             open_cmd,
+            open_wsl,
             open_vscode,
             open_wsl_opencode,
             launch_editor,
@@ -365,4 +457,100 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── get_wsl_distro_and_unix_path ─────────────────────────────────────────
+
+    #[test]
+    fn test_wsl_path_local_drive() {
+        let (distro, unix) = get_wsl_distro_and_unix_path(r"C:\Users\test\file.txt");
+        assert_eq!(distro, "Ubuntu");
+        assert_eq!(unix, "/mnt/c/Users/test/file.txt");
+    }
+
+    #[test]
+    fn test_wsl_path_local_drive_trailing_slash() {
+        let (distro, unix) = get_wsl_distro_and_unix_path(r"D:\Projects\");
+        assert_eq!(unix, "/mnt/d/Projects/");
+    }
+
+    #[test]
+    fn test_wsl_path_wsl_localhost() {
+        let (distro, unix) = get_wsl_distro_and_unix_path(r"\\wsl.localhost\Ubuntu\home\user\file.rs");
+        assert_eq!(distro, "Ubuntu");
+        assert_eq!(unix, "/home/user/file.rs");
+    }
+
+    #[test]
+    fn test_wsl_path_wsl_dollar() {
+        let (distro, unix) = get_wsl_distro_and_unix_path(r"\\wsl$\Debian\var\log");
+        assert_eq!(distro, "Debian");
+        assert_eq!(unix, "/var/log");
+    }
+
+    #[test]
+    fn test_wsl_path_already_unix() {
+        let (distro, unix) = get_wsl_distro_and_unix_path("/home/user");
+        assert_eq!(distro, "Ubuntu");
+        assert_eq!(unix, "/home/user");
+    }
+
+    // ── get_wsl_network_path ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_network_path_local_drive() {
+        let net = get_wsl_network_path(r"C:\Users\test");
+        assert_eq!(net, r"\\wsl.localhost\Ubuntu\mnt\c\Users\test");
+    }
+
+    #[test]
+    fn test_network_path_wsl_localhost_passthrough() {
+        let net = get_wsl_network_path(r"\\wsl.localhost\Ubuntu\home");
+        assert_eq!(net, r"\\wsl.localhost\Ubuntu\home");
+    }
+
+    #[test]
+    fn test_network_path_wsl_dollar_passthrough() {
+        let net = get_wsl_network_path(r"\\wsl$\Debian\tmp");
+        assert_eq!(net, r"\\wsl$\Debian\tmp");
+    }
+
+    #[test]
+    fn test_network_path_drive_letter_d() {
+        let net = get_wsl_network_path(r"D:\data\file.txt");
+        assert_eq!(net, r"\\wsl.localhost\Ubuntu\mnt\d\data\file.txt");
+    }
+
+    #[test]
+    fn test_network_path_no_drive() {
+        let net = get_wsl_network_path(r"\share\folder");
+        assert_eq!(net, r"\share\folder");
+    }
+
+    // ── FileItem ordering ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_file_item_sort_dirs_first_then_alpha() {
+        let mut items = vec![
+            FileItem { name: "zed.txt".into(), path: "/z".into(), is_dir: false },
+            FileItem { name: "alpha".into(),   path: "/a".into(), is_dir: true },
+            FileItem { name: "Beta".into(),     path: "/b".into(), is_dir: true },
+            FileItem { name: "gamma.txt".into(),path: "/g".into(), is_dir: false },
+        ];
+        items.sort_by(|a, b| {
+            if a.is_dir != b.is_dir {
+                b.is_dir.cmp(&a.is_dir)
+            } else {
+                a.name.to_lowercase().cmp(&b.name.to_lowercase())
+            }
+        });
+        assert_eq!(items[0].name, "alpha");   // dir, a
+        assert_eq!(items[1].name, "Beta");    // dir, b
+        assert_eq!(items[2].name, "gamma.txt");
+        assert_eq!(items[3].name, "zed.txt");
+    }
 }

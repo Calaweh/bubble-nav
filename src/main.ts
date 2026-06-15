@@ -270,7 +270,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
     pathHistory.push({ path: currentPath, x: originX, y: originY, exitX, exitY });
     currentPath = node.path;
-    invoke("record_navigate", { path: currentPath, name: label, isDir: true }).catch(() => {});
+    invoke("record_navigate", { path: currentPath, name: label, is_dir: true }).catch(() => {});
     const clamped = clampCoordinates(node.worldX, node.worldY);
     originX = clamped.x;
     originY = clamped.y;
@@ -355,7 +355,7 @@ window.addEventListener("DOMContentLoaded", () => {
           if (!hoveredNode.isDir && !hoveredNode.isAction && hoveredNode.path && (!selectedFile || selectedFile.path !== hoveredNode.path)) {
             pathHistory.push({ path: currentPath, x: originX, y: originY, exitX: 0, exitY: 0 });
             selectedFile = itemsList.find(i => i.path === hoveredNode.path) || null;
-            invoke("record_select", { path: hoveredNode.path, name: hoveredNode.label, isDir: false }).catch(() => {});
+            invoke("record_select", { path: hoveredNode.path, name: hoveredNode.label, is_dir: false }).catch(() => {});
             const clamped = clampCoordinates(hoveredNode.worldX, hoveredNode.worldY);
             originX = clamped.x; originY = clamped.y;
             draggedAway = false; mouseDownX = originX; mouseDownY = originY;
@@ -464,7 +464,7 @@ window.addEventListener("DOMContentLoaded", () => {
         if (!clickedNode.isDir && !clickedNode.isAction && clickedNode.path) {
           pathHistory.push({ path: currentPath, x: originX, y: originY, exitX: 0, exitY: 0 });
           selectedFile = itemsList.find(i => i.path === clickedNode.path) || null;
-          invoke("record_select", { path: clickedNode.path, name: clickedNode.label, isDir: false }).catch(() => {});
+          invoke("record_select", { path: clickedNode.path, name: clickedNode.label, is_dir: false }).catch(() => {});
           const clamped = clampCoordinates(clickedNode.worldX, clickedNode.worldY);
           originX = clamped.x; originY = clamped.y;
           draggedAway = false; mouseDownX = originX; mouseDownY = originY;
@@ -538,12 +538,12 @@ window.addEventListener("DOMContentLoaded", () => {
           if (action === "cancel_editor") {
             selectedEditor = null; expansionPos = 0; targetExpansion = 1; startAnimation();
           } else if (action === "launch_window") {
-            invoke("record_tool", { toolName: selectedEditor, editorName: selectedEditor, env: "window", path: getActiveTargetPath(), name: curName }).catch(() => {});
-            await invoke("launch_editor", { editor: selectedEditor, env: "window", path: getActiveTargetPath() });
+            invoke("record_tool", { tool_name: selectedEditor, editor_name: selectedEditor, env: "window", path: getActiveTargetPath(), name: curName }).catch(() => {});
+            await invoke("launch_editor", { editor: selectedEditor, env: "window", path: getActiveTargetPath() }).catch(e => console.error("launch_editor failed:", e));
             await hideWindow();
           } else if (action === "launch_wsl") {
-            invoke("record_tool", { toolName: selectedEditor, editorName: selectedEditor, env: "wsl", path: getActiveTargetPath(), name: curName }).catch(() => {});
-            await invoke("launch_editor", { editor: selectedEditor, env: "wsl", path: getActiveTargetPath() });
+            invoke("record_tool", { tool_name: selectedEditor, editor_name: selectedEditor, env: "wsl", path: getActiveTargetPath(), name: curName }).catch(() => {});
+            await invoke("launch_editor", { editor: selectedEditor, env: "wsl", path: getActiveTargetPath() }).catch(e => console.error("launch_editor failed:", e));
             await hideWindow();
           }
           return;
@@ -553,14 +553,21 @@ window.addEventListener("DOMContentLoaded", () => {
           if (action.startsWith("select_")) {
             selectedEditor = action.replace("select_", ""); expansionPos = 0; targetExpansion = 1; startAnimation();
           } else if (action === "opencode") {
-            invoke("record_tool", { toolName: "opencode", editorName: null, env: null, path: currentPath, name: curName }).catch(() => {});
-            await invoke("open_wsl_opencode", { path: getActiveTargetPath(), prompt: "start" }); await hideWindow();
+            invoke("record_tool", { tool_name: "opencode", editor_name: null, env: null, path: getActiveTargetPath(), name: curName }).catch(() => {});
+            await invoke("open_wsl_opencode", { path: getActiveTargetPath(), prompt: "start" }).catch(e => console.error("open_wsl_opencode failed:", e));
+            await hideWindow();
           } else if (action === "powershell") {
-            invoke("record_tool", { toolName: "powershell", editorName: null, env: null, path: currentPath, name: curName }).catch(() => {});
-            await invoke("open_powershell", { path: currentPath }); await hideWindow();
+            invoke("record_tool", { tool_name: "powershell", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
+            await invoke("open_powershell", { path: currentPath }).catch(e => console.error("open_powershell failed:", e));
+            await hideWindow();
           } else if (action === "cmd") {
-            invoke("record_tool", { toolName: "cmd", editorName: null, env: null, path: currentPath, name: curName }).catch(() => {});
-            await invoke("open_cmd", { path: currentPath }); await hideWindow();
+            invoke("record_tool", { tool_name: "cmd", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
+            await invoke("open_cmd", { path: currentPath }).catch(e => console.error("open_cmd failed:", e));
+            await hideWindow();
+          } else if (action === "wsl") {
+            invoke("record_tool", { tool_name: "wsl", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
+            await invoke("open_wsl", { path: currentPath }).catch(e => console.error("open_wsl failed:", e));
+            await hideWindow();
           } else if (action === "back") {
             showFolderTools = false; expansionPos = 0; targetExpansion = 1; startAnimation();
           }
@@ -571,18 +578,25 @@ window.addEventListener("DOMContentLoaded", () => {
           if (action.startsWith("select_")) {
             selectedEditor = action.replace("select_", ""); expansionPos = 0; targetExpansion = 1; startAnimation();
           } else if (action === "opencode") {
-            invoke("record_tool", { toolName: "opencode", editorName: null, env: null, path: currentPath, name: curName }).catch(() => {});
-            await invoke("open_wsl_opencode", { path: currentPath, prompt: "start" }); await hideWindow();
+            invoke("record_tool", { tool_name: "opencode", editor_name: null, env: null, path: getActiveTargetPath(), name: curName }).catch(() => {});
+            await invoke("open_wsl_opencode", { path: getActiveTargetPath(), prompt: "start" }).catch(e => console.error("open_wsl_opencode failed:", e));
+            await hideWindow();
           } else if (action === "back") {
             const ps = pathHistory.pop();
             if (ps) { currentPath = ps.path; originX = ps.x; originY = ps.y; }
             selectedFile = null; expansionPos = 0; targetExpansion = 1; startAnimation();
           } else if (action === "powershell") {
-            invoke("record_tool", { toolName: "powershell", editorName: null, env: null, path: currentPath, name: curName }).catch(() => {});
-            await invoke("open_powershell", { path: currentPath }); await hideWindow();
+            invoke("record_tool", { tool_name: "powershell", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
+            await invoke("open_powershell", { path: currentPath }).catch(e => console.error("open_powershell failed:", e));
+            await hideWindow();
           } else if (action === "cmd") {
-            invoke("record_tool", { toolName: "cmd", editorName: null, env: null, path: currentPath, name: curName }).catch(() => {});
-            await invoke("open_cmd", { path: currentPath }); await hideWindow();
+            invoke("record_tool", { tool_name: "cmd", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
+            await invoke("open_cmd", { path: currentPath }).catch(e => console.error("open_cmd failed:", e));
+            await hideWindow();
+          } else if (action === "wsl") {
+            invoke("record_tool", { tool_name: "wsl", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
+            await invoke("open_wsl", { path: currentPath }).catch(e => console.error("open_wsl failed:", e));
+            await hideWindow();
           }
           return;
         }
