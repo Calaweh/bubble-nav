@@ -26,6 +26,49 @@ pub struct ToolStat {
 }
 
 impl StatsDb {
+    pub fn with_connection(conn: Connection) -> Self {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS node_stats (
+                path TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                is_dir INTEGER NOT NULL DEFAULT 0,
+                select_count INTEGER NOT NULL DEFAULT 0,
+                navigate_count INTEGER NOT NULL DEFAULT 0,
+                pass_through_count INTEGER NOT NULL DEFAULT 0,
+                last_accessed TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS tool_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_name TEXT NOT NULL,
+                editor_name TEXT,
+                env TEXT,
+                used_count INTEGER NOT NULL DEFAULT 1,
+                last_used TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(tool_name, editor_name, env)
+            );
+            CREATE TABLE IF NOT EXISTS navigation_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                name TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                tool_name TEXT,
+                timestamp TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        ).expect("Failed to initialize in-memory DB schema");
+        let session_id = format!(
+            "{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        StatsDb {
+            conn: Mutex::new(conn),
+            session_id,
+        }
+    }
+
     pub fn new(db_path: std::path::PathBuf) -> Result<Self, rusqlite::Error> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -213,5 +256,142 @@ impl StatsDb {
             result.push(row.map_err(|e| e.to_string())?);
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn test_db() -> StatsDb {
+        let conn = Connection::open_in_memory().unwrap();
+        StatsDb::with_connection(conn)
+    }
+
+    #[test]
+    fn test_record_and_get_frequent_nodes() {
+        let db = test_db();
+        db.record_navigate("/home", "home", true).unwrap();
+        db.record_navigate("/home", "home", true).unwrap();
+        db.record_select("/home", "home", true).unwrap();
+        db.record_select("/docs", "docs", true).unwrap();
+
+        let nodes = db.get_frequent_nodes(10).unwrap();
+        assert_eq!(nodes.len(), 2);
+
+        let home = nodes.iter().find(|n| n.path == "/home").unwrap();
+        assert_eq!(home.name, "home");
+        assert!(home.is_dir);
+        assert_eq!(home.navigate_count, 2);
+        assert_eq!(home.select_count, 1);
+
+        let docs = nodes.iter().find(|n| n.path == "/docs").unwrap();
+        assert_eq!(docs.select_count, 1);
+        assert_eq!(docs.navigate_count, 0);
+    }
+
+    #[test]
+    fn test_record_pass_through_updates_existing() {
+        let db = test_db();
+        db.record_navigate("/foo", "foo", true).unwrap();
+        db.record_pass_through("/foo", "foo").unwrap();
+
+        let nodes = db.get_frequent_nodes(10).unwrap();
+        let foo = nodes.iter().find(|n| n.path == "/foo").unwrap();
+        assert_eq!(foo.pass_through_count, 1);
+        assert_eq!(foo.navigate_count, 1);
+    }
+
+    #[test]
+    fn test_record_pass_through_noop_on_missing() {
+        let db = test_db();
+        db.record_pass_through("/nonexistent", "x").unwrap();
+        let nodes = db.get_frequent_nodes(10).unwrap();
+        assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn test_record_tool_and_get_frequent_tools() {
+        let db = test_db();
+        db.record_tool("vscode", Some("vscode"), Some("wsl"), "/proj", "proj").unwrap();
+        db.record_tool("vscode", Some("vscode"), Some("wsl"), "/proj", "proj").unwrap();
+        db.record_tool("vscode", Some("vscode"), Some("window"), "/proj", "proj").unwrap();
+        db.record_tool("cmd", None, None, "/proj", "proj").unwrap();
+
+        let tools = db.get_frequent_tools(10).unwrap();
+        assert_eq!(tools.len(), 3);
+
+        let vscode_wsl = tools.iter().find(|t| t.env.as_deref() == Some("wsl")).unwrap();
+        assert_eq!(vscode_wsl.tool_name, "vscode");
+        assert_eq!(vscode_wsl.editor_name.as_deref(), Some("vscode"));
+        assert_eq!(vscode_wsl.used_count, 2);
+
+        let cmd = tools.iter().find(|t| t.tool_name == "cmd").unwrap();
+        assert!(cmd.editor_name.is_none());
+        assert!(cmd.env.is_none());
+        assert_eq!(cmd.used_count, 1);
+    }
+
+    #[test]
+    fn test_frequent_nodes_limited() {
+        let db = test_db();
+        for i in 0..5 {
+            db.record_navigate(&format!("/path{}", i), &format!("name{}", i), false).unwrap();
+        }
+        let nodes = db.get_frequent_nodes(3).unwrap();
+        assert_eq!(nodes.len(), 3);
+    }
+
+    #[test]
+    fn test_frequent_nodes_sorted_by_total() {
+        let db = test_db();
+        db.record_navigate("/a", "a", false).unwrap();
+        for _ in 0..3 {
+            db.record_select("/b", "b", false).unwrap();
+        }
+        for _ in 0..2 {
+            db.record_navigate("/c", "c", false).unwrap();
+        }
+
+        let nodes = db.get_frequent_nodes(10).unwrap();
+        assert_eq!(nodes[0].path, "/b"); // 3 selects
+        assert_eq!(nodes[1].path, "/c"); // 2 navigates
+        assert_eq!(nodes[2].path, "/a"); // 1 navigate
+    }
+
+    #[test]
+    fn test_new_file_based_db() {
+        let dir = std::env::temp_dir().join(format!("bubble-nav-test-{}", std::process::id()));
+        let path = dir.join("test.db");
+        let db = StatsDb::new(path.clone()).unwrap();
+        db.record_navigate("/test", "test", false).unwrap();
+        assert!(path.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_session_id_unique() {
+        let db1 = test_db();
+        let db2 = test_db();
+        assert_ne!(db1.session_id, db2.session_id);
+    }
+
+    #[test]
+    fn test_frequent_tools_empty() {
+        let db = test_db();
+        let tools = db.get_frequent_tools(10).unwrap();
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn test_record_tool_with_none_fields() {
+        let db = test_db();
+        db.record_tool("opencode", None, None, "/x", "x").unwrap();
+        let tools = db.get_frequent_tools(10).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool_name, "opencode");
+        assert!(tools[0].editor_name.is_none());
+        assert!(tools[0].env.is_none());
     }
 }
