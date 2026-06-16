@@ -406,7 +406,7 @@ pub fn run() {
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
         .setup(|app| {
             let shortcut =
-                Shortcut::new(Some(Modifiers::ALT), Code::Space);
+                Shortcut::new(Some(Modifiers::ALT), Code::Backquote);
 
             let handle = app.handle().clone();
             app.global_shortcut().on_shortcut(shortcut, move |_app, s, event| {
