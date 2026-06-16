@@ -1,5 +1,5 @@
 import { FileItem, HistoryState, RenderNode } from "./types";
-import { TOOLS } from "./config";
+import { TOOLS, COLORS, fileColor } from "./config";
 import { getParentPath } from "./utils";
 
 export function calculateLayout(
@@ -31,7 +31,7 @@ export function calculateLayout(
     worldX:    originX,
     worldY:    originY,
     radius:    65,
-    baseColor: selectedEditor ? "#8e44ad" : selectedFile ? "#e2a94a" : "#2c313a"
+    baseColor: selectedEditor ? COLORS.centerEditor : selectedFile ? COLORS.centerFile : COLORS.center
   });
 
   const isBrowsing = !selectedFile && !showFolderTools && !selectedEditor;
@@ -71,7 +71,7 @@ export function calculateLayout(
         worldX: originX + dist * Math.cos(angleToParent),
         worldY: originY + dist * Math.sin(angleToParent),
         radius: 38,
-        baseColor: "#c0392b"
+        baseColor: COLORS.back
       });
 
       const N = itemsToDisplay.length;
@@ -87,7 +87,7 @@ export function calculateLayout(
           worldX: isExited && justExitedX != null ? justExitedX : normalX,
           worldY: isExited && justExitedY != null ? justExitedY : normalY,
           radius: item.is_dir ? 45 : 35,
-          baseColor: isExited ? "#f1c40f" : (item.is_dir ? "#4a90e2" : "#2ecc71")
+          baseColor: isExited ? COLORS.exited : (item.is_dir ? COLORS.dir : fileColor(item.name))
         });
       });
 
@@ -117,7 +117,7 @@ export function calculateLayout(
           worldX: isExited && justExitedX != null ? justExitedX : normalX,
           worldY: isExited && justExitedY != null ? justExitedY : normalY,
           radius: item.is_dir ? 45 : 35,
-          baseColor: isExited ? "#f1c40f" : (item.is_dir ? "#4a90e2" : "#2ecc71")
+          baseColor: isExited ? COLORS.exited : (item.is_dir ? COLORS.dir : fileColor(item.name))
         });
       });
     }
@@ -137,11 +137,11 @@ export function calculateLayout(
     if (selectedEditor) {
       const dist = 180 * expansionPos;
       const envActions = [
-        { label: "Windows", action: "launch_window",  color: "#2ecc71" },
+        { label: "Windows", action: "launch_window",  color: COLORS.file },
         ...(new Set(["vscode","antigravity","visualstudio"]).has(selectedEditor)
-          ? [{ label: "WSL", action: "launch_wsl", color: "#8e44ad" }]
+          ? [{ label: "WSL", action: "launch_wsl", color: COLORS.wsl }]
           : []),
-        { label: "↩ Back", action: "cancel_editor", color: "#c0392b" }
+        { label: "↩ Back", action: "cancel_editor", color: COLORS.back }
       ];
       envActions.forEach((act, i) => {
         newVisible.push({

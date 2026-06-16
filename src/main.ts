@@ -13,7 +13,10 @@ import {
   NODE_EXIT_RATE, 
   POS_SNAP, 
   ALPHA_SNAP, 
-  RAD_SNAP 
+  RAD_SNAP,
+  DRAG_THRESHOLD,
+  MAX_PATH_HISTORY,
+  COLORS
 } from "./config";
 import { 
   lerpSnap, 
@@ -60,6 +63,13 @@ let animatedNodes: AnimatedNode[] = [];
 let justExitedPath: string | null = null;
 let justExitedX: number | null = null;
 let justExitedY: number | null = null;
+
+let errorMessage: string | null = null;
+let loadPulse = 0;
+
+function trimHistory() {
+  while (pathHistory.length > MAX_PATH_HISTORY) pathHistory.shift();
+}
 
 function getActiveTargetPath(): string {
   return selectedFile ? selectedFile.path : currentPath;
@@ -161,12 +171,15 @@ window.addEventListener("DOMContentLoaded", () => {
   async function loadCurrentDirectory() {
     if (isLoadingDir) return;
     isLoadingDir = true;
+    errorMessage = null;
     try {
       itemsList = await invoke("read_directory", { path: currentPath });
       selectedFile = null;
       startAnimation();
     } catch (err) {
       console.error("Failed to load path:", err);
+      errorMessage = `⚠ ${err}`;
+      startAnimation();
     } finally {
       isLoadingDir = false;
     }
@@ -196,6 +209,13 @@ window.addEventListener("DOMContentLoaded", () => {
     const rate = targetExpansion > expansionPos ? EXPAND_RATE : COLLAPSE_RATE;
     expansionPos = lerpSnap(expansionPos, targetExpansion, rate, dt, 0.002);
     const expansionSettled = expansionPos === targetExpansion;
+
+    // Dark vignette behind cluster
+    const vignette = ctx!.createRadialGradient(originX, originY, 0, originX, originY, Math.min(window.innerWidth, window.innerHeight) * 0.6);
+    vignette.addColorStop(0, "rgba(0,0,0,0)");
+    vignette.addColorStop(1, "rgba(0,0,0,0.12)");
+    ctx!.fillStyle = vignette;
+    ctx!.fillRect(0, 0, window.innerWidth, window.innerHeight);
 
     visibleNodes = calculateLayout(
       currentPath,
@@ -231,6 +251,19 @@ window.addEventListener("DOMContentLoaded", () => {
       drawBubble(ctx!, node.curX, node.curY, node.curRadius, node.baseColor, alpha, isHov);
       drawLabel(ctx!, node.label, node.curX, node.curY, node.curRadius, alpha, isCenter);
     });
+
+    // Loading pulse ring around center
+    if (isLoadingDir && centerNode) {
+      loadPulse += dt * 0.08;
+      const pulseR = Math.sin(loadPulse) * 8;
+      drawBubble(ctx!, centerNode.curX, centerNode.curY, centerNode.curRadius + 12 + pulseR, COLORS.loading, 0.3, false);
+    }
+
+    // Error feedback node
+    if (errorMessage && centerNode) {
+      drawBubble(ctx!, centerNode.curX, centerNode.curY + centerNode.curRadius + 50, 28, COLORS.error, 0.9, false);
+      drawLabel(ctx!, errorMessage, centerNode.curX, centerNode.curY + centerNode.curRadius + 50, 28, 0.9, false);
+    }
 
     if (isHolding) {
       const cn = animatedNodes.find(a => a.key === "center");
@@ -269,6 +302,7 @@ window.addEventListener("DOMContentLoaded", () => {
     const exitY = absY - originY;
 
     pathHistory.push({ path: currentPath, x: originX, y: originY, exitX, exitY });
+    trimHistory();
     currentPath = node.path;
     invoke("record_navigate", { path: currentPath, name: label, is_dir: true }).catch(() => {});
     const clamped = clampCoordinates(node.worldX, node.worldY);
@@ -296,8 +330,13 @@ window.addEventListener("DOMContentLoaded", () => {
     originY = clamped.y;
 
     justExitedPath = currentPath;
-    justExitedX = oldOriginX;
-    justExitedY = oldOriginY;
+    if (ps) {
+      justExitedX = ps.x + ps.exitX;
+      justExitedY = ps.y + ps.exitY;
+    } else {
+      justExitedX = oldOriginX;
+      justExitedY = oldOriginY;
+    }
 
     if (ps) {
       currentPath = ps.path;
@@ -323,7 +362,7 @@ window.addEventListener("DOMContentLoaded", () => {
     if (isHolding) {
       const dx = e.clientX - mouseDownX;
       const dy = e.clientY - mouseDownY;
-      if (dx * dx + dy * dy > 25 * 25) draggedAway = true;
+      if (dx * dx + dy * dy > DRAG_THRESHOLD * DRAG_THRESHOLD) draggedAway = true;
 
       if (draggedAway && hoveredNodeIndex !== null && expansionPos > 0.8) {
         const hoveredAnim = animatedNodes[hoveredNodeIndex];
@@ -354,6 +393,7 @@ window.addEventListener("DOMContentLoaded", () => {
           // 3) File selected
           if (!hoveredNode.isDir && !hoveredNode.isAction && hoveredNode.path && (!selectedFile || selectedFile.path !== hoveredNode.path)) {
             pathHistory.push({ path: currentPath, x: originX, y: originY, exitX: 0, exitY: 0 });
+            trimHistory();
             selectedFile = itemsList.find(i => i.path === hoveredNode.path) || null;
             invoke("record_select", { path: hoveredNode.path, name: hoveredNode.label, is_dir: false }).catch(() => {});
             const clamped = clampCoordinates(hoveredNode.worldX, hoveredNode.worldY);
@@ -402,6 +442,58 @@ window.addEventListener("DOMContentLoaded", () => {
   });
 
   async function hideWindow() { await getCurrentWindow().hide(); }
+
+  // ── keyboard navigation ─────────────────────────────────────────────
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") {
+      if (errorMessage) { errorMessage = null; startAnimation(); return; }
+      if (selectedEditor) { selectedEditor = null; expansionPos = 0; targetExpansion = 1; startAnimation(); return; }
+      if (selectedFile || showFolderTools) {
+        const ps = pathHistory.pop();
+        if (ps) { currentPath = ps.path; originX = ps.x; originY = ps.y; }
+        selectedFile = null; showFolderTools = false; expansionPos = 0; targetExpansion = 1; startAnimation(); return;
+      }
+    }
+
+    if (animatedNodes.length < 2) return;
+    const idx = animatedNodes[0]?.key === "center" ? 1 : 0;
+    if (idx >= animatedNodes.length) return;
+    const lastIdx = animatedNodes.length - 1;
+    const cur = hoveredNodeIndex !== null ? Math.max(idx, Math.min(lastIdx, hoveredNodeIndex)) : idx;
+
+    if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+      e.preventDefault();
+      hoveredNodeIndex = cur >= lastIdx ? idx : cur + 1;
+      canvas.style.cursor = "pointer";
+      startAnimation();
+    } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
+      e.preventDefault();
+      hoveredNodeIndex = cur <= idx ? lastIdx : cur - 1;
+      canvas.style.cursor = "pointer";
+      startAnimation();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (hoveredNodeIndex !== null) {
+        const anim = animatedNodes[hoveredNodeIndex];
+        const node = visibleNodes.find((n, i) => nodeKey(n, i) === anim.key);
+        if (!node) return;
+        if (node.isAction) {
+          // Simulate mouseup on the action node
+          const event = new MouseEvent("mouseup");
+          canvas.dispatchEvent(event);
+        } else if (node.isDir || node.isBack) {
+          // Simulate mousedown on the node
+          const event = new MouseEvent("mousedown");
+          canvas.dispatchEvent(event);
+        } else if (node.path) {
+          // Select file
+          const event = new MouseEvent("mousedown");
+          canvas.dispatchEvent(event);
+        }
+      }
+    }
+  });
 
   const appWindow = getCurrentWindow();
   appWindow.onFocusChanged(({ payload: focused }) => {
@@ -463,6 +555,7 @@ window.addEventListener("DOMContentLoaded", () => {
         // Click: select file
         if (!clickedNode.isDir && !clickedNode.isAction && clickedNode.path) {
           pathHistory.push({ path: currentPath, x: originX, y: originY, exitX: 0, exitY: 0 });
+          trimHistory();
           selectedFile = itemsList.find(i => i.path === clickedNode.path) || null;
           invoke("record_select", { path: clickedNode.path, name: clickedNode.label, is_dir: false }).catch(() => {});
           const clamped = clampCoordinates(clickedNode.worldX, clickedNode.worldY);
@@ -485,6 +578,11 @@ window.addEventListener("DOMContentLoaded", () => {
     const releasedIndex   = getNodeAtPosition(currentMouseX, currentMouseY, animatedNodes);
     const releasedAnim    = releasedIndex !== null ? animatedNodes[releasedIndex] : null;
     const isCenterRelease = releasedAnim?.key === "center";
+
+    // Center click: dismiss error
+    if (isCenterRelease && !draggedAway && errorMessage) {
+      errorMessage = null; expansionPos = 0; targetExpansion = 1; startAnimation(); return;
+    }
 
     // Center click: navigate up shortcut
     if (isCenterRelease && !draggedAway) {

@@ -40,7 +40,7 @@ export function getNodeAtPosition(sx: number, sy: number, animatedNodes: Animate
 }
 
 export function clampCoordinates(x: number, y: number): { x: number; y: number } {
-  const m = 245;
+  const m = Math.min(245, Math.min(window.innerWidth, window.innerHeight) * 0.15);
   return {
     x: Math.max(m, Math.min(window.innerWidth  - m, x)),
     y: Math.max(m, Math.min(window.innerHeight - m, y))
