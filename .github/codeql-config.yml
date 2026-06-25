@@ -1,7 +1,0 @@
-paths-ignore:
-  - "data/**"
-  - "**/node_modules/**"
-  - "**/__pycache__/**"
-  - "**/.venv/**"
-  - "**/.ipynb_checkpoints/**"
-  - "**/*.ipynb"
