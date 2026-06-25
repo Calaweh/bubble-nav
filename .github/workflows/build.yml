@@ -1,0 +1,35 @@
+name: Build Windows Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Tauri (release)
+        run: npx tauri build
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bubble-nav-windows
+          path: |
+            src-tauri/target/release/bubble-nav.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: warn
