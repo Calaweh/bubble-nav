@@ -53,3 +53,19 @@ export function nodeKey(node: RenderNode, index: number): string {
   if (node.isBack) return "back";
   return `item:${node.path ?? node.label}`;
 }
+
+export function friendlyError(err: unknown): string {
+  const msg = String(err);
+  const lower = msg.toLowerCase();
+  if (lower.includes("no such file") || lower.includes("does not exist") || lower.includes("not found"))
+    return "Folder not found";
+  if (lower.includes("access denied") || lower.includes("permission denied") || lower.includes("eacces"))
+    return "Access denied by Windows";
+  if (lower.includes("network") || lower.includes("unreachable") || lower.includes("timeout") || lower.includes("etimedout"))
+    return "Network drive unreachable";
+  if (lower.includes("not a directory"))
+    return "Not a valid folder";
+  if (msg.length > 80)
+    return msg.substring(0, 77) + "...";
+  return msg;
+}

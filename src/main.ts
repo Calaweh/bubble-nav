@@ -1,32 +1,36 @@
 import { invoke } from "@tauri-apps/api/core";
-import { enable } from "@tauri-apps/plugin-autostart";
+
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { FileItem, HistoryState, RenderNode, AnimatedNode } from "./types";
-import { 
-  START_PATH, 
-  EXPAND_RATE, 
-  COLLAPSE_RATE, 
-  NODE_MOVE_RATE, 
-  NODE_ALPHA_RATE, 
-  NODE_RAD_RATE, 
-  NODE_EXIT_RATE, 
-  POS_SNAP, 
-  ALPHA_SNAP, 
+import {
+  START_PATH,
+  EXPAND_RATE,
+  COLLAPSE_RATE,
+  NODE_MOVE_RATE,
+  NODE_ALPHA_RATE,
+  NODE_RAD_RATE,
+  NODE_EXIT_RATE,
+  POS_SNAP,
+  ALPHA_SNAP,
   RAD_SNAP,
   DRAG_THRESHOLD,
   MAX_PATH_HISTORY,
+  VIGNETTE_OPACITY,
+  VIGNETTE_RADIUS_SCALE,
   COLORS
 } from "./config";
-import { 
-  lerpSnap, 
-  getParentPath, 
-  getNodeAtPosition, 
-  clampCoordinates, 
-  nodeKey 
+import {
+  lerpSnap,
+  getParentPath,
+  getNodeAtPosition,
+  clampCoordinates,
+  nodeKey,
+  friendlyError
 } from "./utils";
-import { drawBubble, drawConnection, drawLabel } from "./renderer";
+import { drawBubble, drawConnection, drawLabel, drawBadge } from "./renderer";
 import { calculateLayout } from "./layout";
+import { getFileCategory, FILE_BADGE } from "./config";
 
 let currentPath = START_PATH;
 let itemsList: FileItem[] = [];
@@ -48,8 +52,10 @@ let isHolding   = false;
 let draggedAway = false;
 let mouseDownX  = 0;
 let mouseDownY  = 0;
+let mouseDownNodeIndex: number | null = null;
 
 let isLoadingDir = false;
+let loadCancelled = false;
 
 let currentMouseX = window.innerWidth / 2;
 let currentMouseY = window.innerHeight / 2;
@@ -67,6 +73,11 @@ let justExitedY: number | null = null;
 let errorMessage: string | null = null;
 let loadPulse = 0;
 
+let isKeyboardActive = false;
+let exitNodes: AnimatedNode[] = [];
+let isRetryHovered = false;
+let hintTimer = 0;
+
 function trimHistory() {
   while (pathHistory.length > MAX_PATH_HISTORY) pathHistory.shift();
 }
@@ -74,7 +85,6 @@ function trimHistory() {
 function getActiveTargetPath(): string {
   return selectedFile ? selectedFile.path : currentPath;
 }
-
 
 function syncAnimatedNodes(dt: number): boolean {
   let moving = false;
@@ -88,7 +98,7 @@ function syncAnimatedNodes(dt: number): boolean {
     if (index !== 0 || !anim) {
       anim = animatedNodes.find((a) => a.key === key);
     }
-    
+
     if (!anim) {
       const isCenter = index === 0;
       const centerAnim = animatedNodes.find(a => a.key === "center");
@@ -171,14 +181,20 @@ window.addEventListener("DOMContentLoaded", () => {
   async function loadCurrentDirectory() {
     if (isLoadingDir) return;
     isLoadingDir = true;
+    loadCancelled = false;
     errorMessage = null;
     try {
       itemsList = await invoke("read_directory", { path: currentPath });
+      if (loadCancelled) {
+        errorMessage = "Cancelled";
+        startAnimation();
+        return;
+      }
       selectedFile = null;
       startAnimation();
     } catch (err) {
       console.error("Failed to load path:", err);
-      errorMessage = `⚠ ${err}`;
+      errorMessage = friendlyError(err);
       startAnimation();
     } finally {
       isLoadingDir = false;
@@ -210,10 +226,14 @@ window.addEventListener("DOMContentLoaded", () => {
     expansionPos = lerpSnap(expansionPos, targetExpansion, rate, dt, 0.002);
     const expansionSettled = expansionPos === targetExpansion;
 
+    const isBrowsing = !selectedFile && !showFolderTools && !selectedEditor;
+
     // Dark vignette behind cluster
-    const vignette = ctx!.createRadialGradient(originX, originY, 0, originX, originY, Math.min(window.innerWidth, window.innerHeight) * 0.6);
+    const vignetteR = Math.min(window.innerWidth, window.innerHeight) * VIGNETTE_RADIUS_SCALE;
+    const vignette = ctx!.createRadialGradient(originX, originY, 0, originX, originY, vignetteR);
     vignette.addColorStop(0, "rgba(0,0,0,0)");
-    vignette.addColorStop(1, "rgba(0,0,0,0.12)");
+    vignette.addColorStop(0.4, `rgba(0,0,0,${VIGNETTE_OPACITY * 0.3})`);
+    vignette.addColorStop(1, `rgba(0,0,0,${VIGNETTE_OPACITY})`);
     ctx!.fillStyle = vignette;
     ctx!.fillRect(0, 0, window.innerWidth, window.innerHeight);
 
@@ -231,25 +251,53 @@ window.addEventListener("DOMContentLoaded", () => {
       justExitedX,
       justExitedY
     );
+
+    // Tick exit nodes (crossfade from previous navigation)
+    exitNodes = exitNodes.filter(n => {
+      n.curX = lerpSnap(n.curX, originX, NODE_EXIT_RATE, dt, POS_SNAP);
+      n.curY = lerpSnap(n.curY, originY, NODE_EXIT_RATE, dt, POS_SNAP);
+      n.curRadius = lerpSnap(n.curRadius, 0, NODE_EXIT_RATE, dt, RAD_SNAP);
+      n.curAlpha = lerpSnap(n.curAlpha, 0, NODE_EXIT_RATE, dt, ALPHA_SNAP);
+      return n.curRadius > RAD_SNAP || n.curAlpha > ALPHA_SNAP;
+    });
+
     const nodesMoving = syncAnimatedNodes(dt);
 
+    // Draw crossfade exit nodes (behind current content)
+    exitNodes.forEach(n => {
+      drawBubble(ctx!, n.curX, n.curY, n.curRadius, n.baseColor, n.curAlpha, false);
+    });
+    exitNodes.forEach(n => {
+      drawLabel(ctx!, n.label, n.curX, n.curY, n.curRadius, n.curAlpha, n.key === "center");
+    });
+
+    // Connections
     const centerNode = animatedNodes.find(a => a.key === "center");
+    let connIndex = 0;
     animatedNodes.forEach((node) => {
       if (node.key === "center" || !centerNode) return;
       const isHov = hoveredNodeIndex !== null
         && animatedNodes[hoveredNodeIndex]?.key === node.key
         && expansionPos > 0.85;
-      drawConnection(ctx!, centerNode.curX, centerNode.curY, node.curX, node.curY, node.curAlpha, isHov);
+      drawConnection(ctx!, centerNode.curX, centerNode.curY, node.curX, node.curY, node.curAlpha, isHov, connIndex);
+      connIndex++;
     });
 
+    // Bubbles, labels, and badges
     animatedNodes.forEach((node) => {
       const isCenter = node.key === "center";
       const isHov    = hoveredNodeIndex !== null
         && animatedNodes[hoveredNodeIndex]?.key === node.key
         && expansionPos > 0.85;
+      const isKeyFocus = isKeyboardActive && isHov;
       const alpha = isCenter ? 1 : node.curAlpha;
-      drawBubble(ctx!, node.curX, node.curY, node.curRadius, node.baseColor, alpha, isHov);
+      drawBubble(ctx!, node.curX, node.curY, node.curRadius, node.baseColor, alpha, isHov, isKeyFocus);
       drawLabel(ctx!, node.label, node.curX, node.curY, node.curRadius, alpha, isCenter);
+      // File type badges
+      if (!node.isDir && !node.isAction && node.path) {
+        const cat = getFileCategory(node.label);
+        drawBadge(ctx!, node.curX, node.curY, node.curRadius, FILE_BADGE[cat], alpha);
+      }
     });
 
     // Loading pulse ring around center
@@ -259,12 +307,19 @@ window.addEventListener("DOMContentLoaded", () => {
       drawBubble(ctx!, centerNode.curX, centerNode.curY, centerNode.curRadius + 12 + pulseR, COLORS.loading, 0.3, false);
     }
 
-    // Error feedback node
-    if (errorMessage && centerNode) {
-      drawBubble(ctx!, centerNode.curX, centerNode.curY + centerNode.curRadius + 50, 28, COLORS.error, 0.9, false);
-      drawLabel(ctx!, errorMessage, centerNode.curX, centerNode.curY + centerNode.curRadius + 50, 28, 0.9, false);
+    // Error + retry
+    if (errorMessage && centerNode && !isLoadingDir) {
+      const errorY = centerNode.curY + centerNode.curRadius + 50;
+      drawBubble(ctx!, centerNode.curX, errorY, 28, COLORS.error, 0.9, false);
+      drawLabel(ctx!, errorMessage, centerNode.curX, errorY, 28, 0.9, false);
+
+      // Retry bubble
+      const retryY = errorY + 55;
+      drawBubble(ctx!, centerNode.curX, retryY, 24, COLORS.loading, 0.9, isRetryHovered);
+      drawLabel(ctx!, "Retry", centerNode.curX, retryY, 24, 0.9, false);
     }
 
+    // Drag tether
     if (isHolding) {
       const cn = animatedNodes.find(a => a.key === "center");
       if (cn) {
@@ -278,11 +333,43 @@ window.addEventListener("DOMContentLoaded", () => {
         const pad = ar + 4;
         const sx = dist > pad ? ax + (dx / dist) * pad : ax;
         const sy = dist > pad ? ay + (dy / dist) * pad : ay;
-        drawConnection(ctx!, sx, sy, currentMouseX, currentMouseY, 1, true);
+        drawConnection(ctx!, sx, sy, currentMouseX, currentMouseY, 1, true, 0);
+
+        // Arrowhead dots along drag tether when dragged away
+        if (draggedAway) {
+          for (let t = 0.25; t < 1; t += 0.25) {
+            const dotX = sx + (currentMouseX - sx) * t;
+            const dotY = sy + (currentMouseY - sy) * t;
+            ctx!.beginPath();
+            ctx!.arc(dotX, dotY, 3, 0, Math.PI * 2);
+            ctx!.fillStyle = `rgba(100,210,160,0.5)`;
+            ctx!.fill();
+          }
+        }
       }
     }
 
-    if (expansionSettled && !nodesMoving && !isHolding) {
+    // Idle hint text
+    if (isBrowsing) {
+      if (!isHolding && !isLoadingDir && !errorMessage && hoveredNodeIndex === null) {
+        hintTimer++;
+      } else {
+        hintTimer = 0;
+      }
+    } else {
+      hintTimer = 0;
+    }
+    if (hintTimer > 90 && centerNode) {
+      const hintAlpha = Math.min(1, (hintTimer - 90) / 30);
+      ctx!.globalAlpha = hintAlpha * 0.5;
+      ctx!.font = "12px -apple-system,system-ui,sans-serif";
+      ctx!.textAlign = "center";
+      ctx!.fillStyle = "rgba(255,255,255,0.6)";
+      ctx!.fillText("Click center to go back · Drag to navigate", centerNode.curX, centerNode.curY + centerNode.curRadius + 30);
+      ctx!.globalAlpha = 1;
+    }
+
+    if (expansionSettled && !nodesMoving && !isHolding && exitNodes.length === 0) {
       isAnimating = false;
       return;
     }
@@ -293,11 +380,10 @@ window.addEventListener("DOMContentLoaded", () => {
   // ── helpers shared by mousedown and mousemove back-navigation ──────────────
 
   function doNavigateDown(node: RenderNode & { path: string }, label: string) {
+    snapshotExitNodes();
     const animNode = animatedNodes.find(a => a.path === node.path);
     const absX = animNode ? animNode.curX : node.worldX;
     const absY = animNode ? animNode.curY : node.worldY;
-    // Store as offset relative to current origin, so on the way back we can
-    // reconstruct the exact same screen position regardless of where originX/Y ends up.
     const exitX = absX - originX;
     const exitY = absY - originY;
 
@@ -314,15 +400,12 @@ window.addEventListener("DOMContentLoaded", () => {
   }
 
   function doNavigateBack(backNodeWorldX: number, backNodeWorldY: number, poppedState?: HistoryState | null) {
+    snapshotExitNodes();
     invoke("record_pass_through", { path: currentPath, name: visibleNodes[0]?.label || "" }).catch(() => {});
 
-    // If poppedState is provided, use it instead of popping pathHistory.
     const ps = poppedState !== undefined ? poppedState : pathHistory.pop();
     const clamped = clampCoordinates(backNodeWorldX, backNodeWorldY);
 
-    // Capture the current origin before it changes — this is the absolute screen
-    // position of the folder we are leaving, which is exactly where it appeared
-    // as a satellite in the parent view.
     const oldOriginX = originX;
     const oldOriginY = originY;
 
@@ -346,16 +429,209 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  // ── mousemove ─────────────────────────────────────────────────────────────
+  function snapshotExitNodes() {
+    exitNodes = animatedNodes.map(n => ({ ...n }));
+  }
+
+  // ── activateNode / executeAction ──────────────────────────────────────
+
+  async function activateNode(node: RenderNode) {
+    if (node.isAction && node.actionId) {
+      await executeAction(node.actionId);
+      return;
+    }
+
+    // Navigate down into folder
+    if (node.isDir && node.path && currentPath !== node.path && !node.isBack) {
+      doNavigateDown(node as RenderNode & { path: string }, node.label);
+      draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+      hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
+      startAnimation();
+      await loadCurrentDirectory();
+      return;
+    }
+
+    // cd .. back
+    if (node.isBack) {
+      doNavigateBack(node.worldX, node.worldY);
+      draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+      hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
+      startAnimation();
+      await loadCurrentDirectory();
+      return;
+    }
+
+    // Select file
+    if (!node.isDir && !node.isAction && node.path) {
+      pathHistory.push({ path: currentPath, x: originX, y: originY, exitX: 0, exitY: 0 });
+      trimHistory();
+      selectedFile = itemsList.find(i => i.path === node.path) || null;
+      invoke("record_select", { path: node.path, name: node.label, is_dir: false }).catch(() => {});
+      const clamped = clampCoordinates(node.worldX, node.worldY);
+      originX = clamped.x; originY = clamped.y;
+      draggedAway = false; mouseDownX = originX; mouseDownY = originY;
+      hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
+      startAnimation();
+    }
+  }
+
+  async function executeAction(actionId: string) {
+    const curName = currentPath.split(/[\\/]/).pop() || currentPath;
+
+    if (selectedEditor) {
+      if (actionId === "cancel_editor") {
+        selectedEditor = null; expansionPos = 0; targetExpansion = 1; startAnimation();
+      } else if (actionId === "launch_window") {
+        invoke("record_tool", { tool_name: selectedEditor, editor_name: selectedEditor, env: "window", path: getActiveTargetPath(), name: curName }).catch(() => {});
+        try {
+          await invoke("launch_editor", { editor: selectedEditor, env: "window", path: getActiveTargetPath() });
+          await hideWindow();
+        } catch (e) {
+          errorMessage = friendlyError(e);
+          startAnimation();
+        }
+      } else if (actionId === "launch_wsl") {
+        invoke("record_tool", { tool_name: selectedEditor, editor_name: selectedEditor, env: "wsl", path: getActiveTargetPath(), name: curName }).catch(() => {});
+        try {
+          await invoke("launch_editor", { editor: selectedEditor, env: "wsl", path: getActiveTargetPath() });
+          await hideWindow();
+        } catch (e) {
+          errorMessage = friendlyError(e);
+          startAnimation();
+        }
+      }
+      return;
+    }
+
+    if (showFolderTools) {
+      if (actionId.startsWith("select_")) {
+        selectedEditor = actionId.replace("select_", ""); expansionPos = 0; targetExpansion = 1; startAnimation();
+      } else if (actionId === "opencode") {
+        invoke("record_tool", { tool_name: "opencode", editor_name: null, env: null, path: getActiveTargetPath(), name: curName }).catch(() => {});
+        try {
+          await invoke("open_wsl_opencode", { path: getActiveTargetPath(), prompt: "start" });
+          await hideWindow();
+        } catch (e) {
+          errorMessage = friendlyError(e);
+          startAnimation();
+        }
+      } else if (actionId === "powershell") {
+        invoke("record_tool", { tool_name: "powershell", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
+        try {
+          await invoke("open_powershell", { path: currentPath });
+          await hideWindow();
+        } catch (e) {
+          errorMessage = friendlyError(e);
+          startAnimation();
+        }
+      } else if (actionId === "cmd") {
+        invoke("record_tool", { tool_name: "cmd", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
+        try {
+          await invoke("open_cmd", { path: currentPath });
+          await hideWindow();
+        } catch (e) {
+          errorMessage = friendlyError(e);
+          startAnimation();
+        }
+      } else if (actionId === "wsl") {
+        invoke("record_tool", { tool_name: "wsl", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
+        try {
+          await invoke("open_wsl", { path: currentPath });
+          await hideWindow();
+        } catch (e) {
+          errorMessage = friendlyError(e);
+          startAnimation();
+        }
+      } else if (actionId === "back") {
+        showFolderTools = false; expansionPos = 0; targetExpansion = 1; startAnimation();
+      }
+      return;
+    }
+
+    if (selectedFile) {
+      if (actionId.startsWith("select_")) {
+        selectedEditor = actionId.replace("select_", ""); expansionPos = 0; targetExpansion = 1; startAnimation();
+      } else if (actionId === "opencode") {
+        invoke("record_tool", { tool_name: "opencode", editor_name: null, env: null, path: getActiveTargetPath(), name: curName }).catch(() => {});
+        try {
+          await invoke("open_wsl_opencode", { path: getActiveTargetPath(), prompt: "start" });
+          await hideWindow();
+        } catch (e) {
+          errorMessage = friendlyError(e);
+          startAnimation();
+        }
+      } else if (actionId === "back") {
+        const ps = pathHistory.pop();
+        if (ps) { currentPath = ps.path; originX = ps.x; originY = ps.y; }
+        selectedFile = null; expansionPos = 0; targetExpansion = 1; startAnimation();
+      } else if (actionId === "powershell") {
+        invoke("record_tool", { tool_name: "powershell", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
+        try {
+          await invoke("open_powershell", { path: currentPath });
+          await hideWindow();
+        } catch (e) {
+          errorMessage = friendlyError(e);
+          startAnimation();
+        }
+      } else if (actionId === "cmd") {
+        invoke("record_tool", { tool_name: "cmd", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
+        try {
+          await invoke("open_cmd", { path: currentPath });
+          await hideWindow();
+        } catch (e) {
+          errorMessage = friendlyError(e);
+          startAnimation();
+        }
+      } else if (actionId === "wsl") {
+        invoke("record_tool", { tool_name: "wsl", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
+        try {
+          await invoke("open_wsl", { path: currentPath });
+          await hideWindow();
+        } catch (e) {
+          errorMessage = friendlyError(e);
+          startAnimation();
+        }
+      }
+      return;
+    }
+
+    // Browsing mode actions
+    if (actionId === "show_tools") {
+      showFolderTools = true; expansionPos = 0; targetExpansion = 1; startAnimation();
+    }
+  }
+
+  // ── mousemove ─────────────────────────────────────────────────────────
 
   canvas.addEventListener("mousemove", async (e) => {
     currentMouseX = e.clientX;
     currentMouseY = e.clientY;
 
+    if (isKeyboardActive) {
+      isKeyboardActive = false;
+      startAnimation();
+    }
+
     const prev = hoveredNodeIndex;
     hoveredNodeIndex = getNodeAtPosition(e.clientX, e.clientY, animatedNodes);
-    canvas.style.cursor = hoveredNodeIndex !== null ? "pointer" : "default";
-    if (prev !== hoveredNodeIndex) startAnimation();
+
+    // Check retry bubble hover
+    isRetryHovered = false;
+    if (errorMessage) {
+      const cn = animatedNodes.find(a => a.key === "center");
+      if (cn) {
+        const retryY = cn.curY + cn.curRadius + 50 + 55;
+        const rdx = e.clientX - cn.curX;
+        const rdy = e.clientY - retryY;
+        if (rdx * rdx + rdy * rdy < 24 * 24) {
+          isRetryHovered = true;
+        }
+      }
+    }
+
+    const cursorTarget = isRetryHovered ? "pointer" : (hoveredNodeIndex !== null ? "pointer" : "default");
+    canvas.style.cursor = cursorTarget;
+    if (prev !== hoveredNodeIndex || isRetryHovered) startAnimation();
 
     if (isLoadingDir) return;
 
@@ -369,8 +645,6 @@ window.addEventListener("DOMContentLoaded", () => {
         const hoveredNode = visibleNodes.find((n, idx) => nodeKey(n, idx) === hoveredAnim.key);
 
         if (hoveredNode && hoveredAnim.key !== "center") {
-
-          // 1) Navigate down into folder
           if (hoveredNode.isDir && hoveredNode.path && currentPath !== hoveredNode.path && !hoveredNode.isBack) {
             doNavigateDown(hoveredNode as RenderNode & { path: string }, hoveredNode.label);
             draggedAway = false; mouseDownX = originX; mouseDownY = originY;
@@ -380,7 +654,6 @@ window.addEventListener("DOMContentLoaded", () => {
             return;
           }
 
-          // 2) cd .. back
           if (hoveredNode.isBack) {
             doNavigateBack(hoveredNode.worldX, hoveredNode.worldY);
             draggedAway = false; mouseDownX = originX; mouseDownY = originY;
@@ -390,7 +663,6 @@ window.addEventListener("DOMContentLoaded", () => {
             return;
           }
 
-          // 3) File selected
           if (!hoveredNode.isDir && !hoveredNode.isAction && hoveredNode.path && (!selectedFile || selectedFile.path !== hoveredNode.path)) {
             pathHistory.push({ path: currentPath, x: originX, y: originY, exitX: 0, exitY: 0 });
             trimHistory();
@@ -404,7 +676,6 @@ window.addEventListener("DOMContentLoaded", () => {
             return;
           }
 
-          // 4) Action sub-menu
           if (hoveredNode.isAction && hoveredNode.actionId) {
             const action = hoveredNode.actionId;
 
@@ -439,14 +710,19 @@ window.addEventListener("DOMContentLoaded", () => {
 
   canvas.addEventListener("mouseleave", () => {
     if (hoveredNodeIndex !== null) { hoveredNodeIndex = null; startAnimation(); }
+    isRetryHovered = false;
   });
 
   async function hideWindow() { await getCurrentWindow().hide(); }
 
   // ── keyboard navigation ─────────────────────────────────────────────
 
-  document.addEventListener("keydown", (e) => {
+  document.addEventListener("keydown", async (e) => {
     if (e.key === "Escape") {
+      if (isLoadingDir) {
+        loadCancelled = true;
+        return;
+      }
       if (errorMessage) { errorMessage = null; startAnimation(); return; }
       if (selectedEditor) { selectedEditor = null; expansionPos = 0; targetExpansion = 1; startAnimation(); return; }
       if (selectedFile || showFolderTools) {
@@ -464,33 +740,22 @@ window.addEventListener("DOMContentLoaded", () => {
 
     if (e.key === "ArrowRight" || e.key === "ArrowDown") {
       e.preventDefault();
+      isKeyboardActive = true;
       hoveredNodeIndex = cur >= lastIdx ? idx : cur + 1;
       canvas.style.cursor = "pointer";
       startAnimation();
     } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
       e.preventDefault();
+      isKeyboardActive = true;
       hoveredNodeIndex = cur <= idx ? lastIdx : cur - 1;
       canvas.style.cursor = "pointer";
       startAnimation();
     } else if (e.key === "Enter") {
       e.preventDefault();
-      if (hoveredNodeIndex !== null) {
+      if (hoveredNodeIndex !== null && expansionPos > 0.8) {
         const anim = animatedNodes[hoveredNodeIndex];
         const node = visibleNodes.find((n, i) => nodeKey(n, i) === anim.key);
-        if (!node) return;
-        if (node.isAction) {
-          // Simulate mouseup on the action node
-          const event = new MouseEvent("mouseup");
-          canvas.dispatchEvent(event);
-        } else if (node.isDir || node.isBack) {
-          // Simulate mousedown on the node
-          const event = new MouseEvent("mousedown");
-          canvas.dispatchEvent(event);
-        } else if (node.path) {
-          // Select file
-          const event = new MouseEvent("mousedown");
-          canvas.dispatchEvent(event);
-        }
+        if (node) await activateNode(node);
       }
     }
   });
@@ -512,6 +777,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
     isHolding = true; draggedAway = false;
     mouseDownX = e.clientX; mouseDownY = e.clientY;
+    mouseDownNodeIndex = clickedIndex;
 
     if (expansionPos < 0.85) {
       if (isCenterClick) {
@@ -525,46 +791,9 @@ window.addEventListener("DOMContentLoaded", () => {
     }
 
     if (clickedIndex === null) { isHolding = false; return; }
-
     if (clickedAnim && !isCenterClick) {
       const clickedNode = visibleNodes.find((n, idx) => nodeKey(n, idx) === clickedAnim.key) ?? null;
-      if (clickedNode) {
-        if (clickedNode.isAction) { isHolding = true; return; }
-        isHolding = false;
-
-        // Click: navigate down
-        if (clickedNode.isDir && clickedNode.path && currentPath !== clickedNode.path && !clickedNode.isBack) {
-          doNavigateDown(clickedNode as RenderNode & { path: string }, clickedNode.label);
-          draggedAway = false; mouseDownX = originX; mouseDownY = originY;
-          hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
-          startAnimation();
-          await loadCurrentDirectory();
-          return;
-        }
-
-        // Click: navigate up
-        if (clickedNode.isBack) {
-          doNavigateBack(clickedNode.worldX, clickedNode.worldY);
-          draggedAway = false; mouseDownX = originX; mouseDownY = originY;
-          hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
-          startAnimation();
-          await loadCurrentDirectory();
-          return;
-        }
-
-        // Click: select file
-        if (!clickedNode.isDir && !clickedNode.isAction && clickedNode.path) {
-          pathHistory.push({ path: currentPath, x: originX, y: originY, exitX: 0, exitY: 0 });
-          trimHistory();
-          selectedFile = itemsList.find(i => i.path === clickedNode.path) || null;
-          invoke("record_select", { path: clickedNode.path, name: clickedNode.label, is_dir: false }).catch(() => {});
-          const clamped = clampCoordinates(clickedNode.worldX, clickedNode.worldY);
-          originX = clamped.x; originY = clamped.y;
-          draggedAway = false; mouseDownX = originX; mouseDownY = originY;
-          hoveredNodeIndex = null; expansionPos = 0; targetExpansion = 1;
-          startAnimation(); return;
-        }
-      }
+      if (clickedNode && clickedNode.isAction) { isHolding = true; return; }
     }
   });
 
@@ -575,16 +804,24 @@ window.addEventListener("DOMContentLoaded", () => {
     isHolding = false;
     if (isLoadingDir) return;
 
-    const releasedIndex   = getNodeAtPosition(currentMouseX, currentMouseY, animatedNodes);
-    const releasedAnim    = releasedIndex !== null ? animatedNodes[releasedIndex] : null;
-    const isCenterRelease = releasedAnim?.key === "center";
+    // Determine target node: if dragged away, use hovered; otherwise use what was pressed
+    const targetIndex = draggedAway ? hoveredNodeIndex : mouseDownNodeIndex;
+    const targetAnim  = targetIndex !== null ? animatedNodes[targetIndex] : null;
+    const isCenterRelease = targetAnim?.key === "center";
+
+    // Retry button
+    if (isRetryHovered && errorMessage) {
+      errorMessage = null;
+      await loadCurrentDirectory();
+      return;
+    }
 
     // Center click: dismiss error
     if (isCenterRelease && !draggedAway && errorMessage) {
       errorMessage = null; expansionPos = 0; targetExpansion = 1; startAnimation(); return;
     }
 
-    // Center click: navigate up shortcut
+    // Center click: navigate up / back shortcut
     if (isCenterRelease && !draggedAway) {
       if (selectedEditor) {
         selectedEditor = null; expansionPos = 0; targetExpansion = 1; startAnimation(); return;
@@ -624,83 +861,16 @@ window.addEventListener("DOMContentLoaded", () => {
       return;
     }
 
-    if (hoveredNodeIndex !== null && expansionPos > 0.8) {
-      const hoveredAnim = animatedNodes[hoveredNodeIndex];
-      const hoveredNode = visibleNodes.find((n, idx) => nodeKey(n, idx) === hoveredAnim.key);
-
-      if (hoveredNode && hoveredNode.isAction && hoveredNode.actionId) {
-        const action  = hoveredNode.actionId;
-        const curName = currentPath.split(/[\\/]/).pop() || currentPath;
-
-        if (selectedEditor) {
-          if (action === "cancel_editor") {
-            selectedEditor = null; expansionPos = 0; targetExpansion = 1; startAnimation();
-          } else if (action === "launch_window") {
-            invoke("record_tool", { tool_name: selectedEditor, editor_name: selectedEditor, env: "window", path: getActiveTargetPath(), name: curName }).catch(() => {});
-            await invoke("launch_editor", { editor: selectedEditor, env: "window", path: getActiveTargetPath() }).catch(e => console.error("launch_editor failed:", e));
-            await hideWindow();
-          } else if (action === "launch_wsl") {
-            invoke("record_tool", { tool_name: selectedEditor, editor_name: selectedEditor, env: "wsl", path: getActiveTargetPath(), name: curName }).catch(() => {});
-            await invoke("launch_editor", { editor: selectedEditor, env: "wsl", path: getActiveTargetPath() }).catch(e => console.error("launch_editor failed:", e));
-            await hideWindow();
-          }
-          return;
-        }
-
-        if (showFolderTools) {
-          if (action.startsWith("select_")) {
-            selectedEditor = action.replace("select_", ""); expansionPos = 0; targetExpansion = 1; startAnimation();
-          } else if (action === "opencode") {
-            invoke("record_tool", { tool_name: "opencode", editor_name: null, env: null, path: getActiveTargetPath(), name: curName }).catch(() => {});
-            await invoke("open_wsl_opencode", { path: getActiveTargetPath(), prompt: "start" }).catch(e => console.error("open_wsl_opencode failed:", e));
-            await hideWindow();
-          } else if (action === "powershell") {
-            invoke("record_tool", { tool_name: "powershell", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
-            await invoke("open_powershell", { path: currentPath }).catch(e => console.error("open_powershell failed:", e));
-            await hideWindow();
-          } else if (action === "cmd") {
-            invoke("record_tool", { tool_name: "cmd", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
-            await invoke("open_cmd", { path: currentPath }).catch(e => console.error("open_cmd failed:", e));
-            await hideWindow();
-          } else if (action === "wsl") {
-            invoke("record_tool", { tool_name: "wsl", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
-            await invoke("open_wsl", { path: currentPath }).catch(e => console.error("open_wsl failed:", e));
-            await hideWindow();
-          } else if (action === "back") {
-            showFolderTools = false; expansionPos = 0; targetExpansion = 1; startAnimation();
-          }
-          return;
-        }
-
-        if (selectedFile) {
-          if (action.startsWith("select_")) {
-            selectedEditor = action.replace("select_", ""); expansionPos = 0; targetExpansion = 1; startAnimation();
-          } else if (action === "opencode") {
-            invoke("record_tool", { tool_name: "opencode", editor_name: null, env: null, path: getActiveTargetPath(), name: curName }).catch(() => {});
-            await invoke("open_wsl_opencode", { path: getActiveTargetPath(), prompt: "start" }).catch(e => console.error("open_wsl_opencode failed:", e));
-            await hideWindow();
-          } else if (action === "back") {
-            const ps = pathHistory.pop();
-            if (ps) { currentPath = ps.path; originX = ps.x; originY = ps.y; }
-            selectedFile = null; expansionPos = 0; targetExpansion = 1; startAnimation();
-          } else if (action === "powershell") {
-            invoke("record_tool", { tool_name: "powershell", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
-            await invoke("open_powershell", { path: currentPath }).catch(e => console.error("open_powershell failed:", e));
-            await hideWindow();
-          } else if (action === "cmd") {
-            invoke("record_tool", { tool_name: "cmd", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
-            await invoke("open_cmd", { path: currentPath }).catch(e => console.error("open_cmd failed:", e));
-            await hideWindow();
-          } else if (action === "wsl") {
-            invoke("record_tool", { tool_name: "wsl", editor_name: null, env: null, path: currentPath, name: curName }).catch(() => {});
-            await invoke("open_wsl", { path: currentPath }).catch(e => console.error("open_wsl failed:", e));
-            await hideWindow();
-          }
-          return;
-        }
+    // Activate node
+    if (targetAnim && !isCenterRelease && expansionPos > 0.8) {
+      const targetNode = visibleNodes.find((n, idx) => nodeKey(n, idx) === targetAnim.key);
+      if (targetNode) {
+        await activateNode(targetNode);
+        return;
       }
     }
 
+    // Click empty space → show folder tools
     if (!selectedFile && !selectedEditor && !showFolderTools) {
       if (draggedAway || hoveredNodeIndex === null || animatedNodes[hoveredNodeIndex]?.key !== "center") {
         showFolderTools = true; expansionPos = 0; targetExpansion = 1; startAnimation();
@@ -709,5 +879,4 @@ window.addEventListener("DOMContentLoaded", () => {
   });
 
   loadCurrentDirectory().then(() => { startAnimation(); });
-  enable().catch(() => {});
 });

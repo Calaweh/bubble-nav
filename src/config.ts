@@ -16,29 +16,36 @@ export const DRAG_THRESHOLD = 40;
 
 export const MAX_PATH_HISTORY = 32;
 
+export const MAX_VISIBLE_ITEMS = 24;
+export const MIN_SATELLITE_RADIUS = 28;
+
+export const VIGNETTE_OPACITY = 0.25;
+export const VIGNETTE_RADIUS_SCALE = 0.55;
+
 export const COLORS = {
   dir:       "#4a90e2",
   file:      "#2ecc71",
   back:      "#c0392b",
   center:    "#2c313a",
   centerFile:  "#e2a94a",
-  centerEditor: "#8e44ad",
+  centerEditor: "#9b59b6",
   exited:    "#f1c40f",
   error:     "#e74c3c",
   loading:   "#f39c12",
-  vscode:    "#4a90e2",
-  visualstudio: "#8e44ad",
+  vscode:    "#007acc",
+  visualstudio: "#5c2d91",
   antigravity:  "#1abc9c",
   opencode:  "#e67e22",
   powershell: "#27ae60",
   cmd:       "#607080",
-  wsl:       "#8e44ad",
+  wsl:       "#e95420",
   code:      "#5dade2",
   doc:       "#a569bd",
   image:     "#e59866",
   data:      "#48c9b0",
-  binary:    "#e74c3c",
+  binary:    "#d35400",
   other:     "#95a5a6",
+  tools:     "#7f8c8d",
 } as const;
 
 const CODE_EXT = new Set([
@@ -60,15 +67,39 @@ const BIN_EXT = new Set([
   "exe","dll","so","dylib","bin","dat","pdb","obj","o","a","lib","msi","deb","rpm",
 ]);
 
-export function fileColor(filename: string): string {
+export type FileCategory = "code" | "doc" | "image" | "data" | "binary" | "other";
+
+export function getFileCategory(filename: string): FileCategory {
   const ext = filename.split(".").pop()?.toLowerCase() || "";
-  if (CODE_EXT.has(ext)) return COLORS.code;
-  if (DOC_EXT.has(ext)) return COLORS.doc;
-  if (IMAGE_EXT.has(ext)) return COLORS.image;
-  if (DATA_EXT.has(ext)) return COLORS.data;
-  if (BIN_EXT.has(ext)) return COLORS.binary;
-  return COLORS.other;
+  if (CODE_EXT.has(ext)) return "code";
+  if (DOC_EXT.has(ext)) return "doc";
+  if (IMAGE_EXT.has(ext)) return "image";
+  if (DATA_EXT.has(ext)) return "data";
+  if (BIN_EXT.has(ext)) return "binary";
+  return "other";
 }
+
+export function fileColor(filename: string): string {
+  const cat = getFileCategory(filename);
+  const map: Record<FileCategory, string> = {
+    code: COLORS.code,
+    doc: COLORS.doc,
+    image: COLORS.image,
+    data: COLORS.data,
+    binary: COLORS.binary,
+    other: COLORS.other,
+  };
+  return map[cat];
+}
+
+export const FILE_BADGE: Record<FileCategory, string> = {
+  code:   "<>",
+  doc:    "MD",
+  image:  "IMG",
+  data:   "{}",
+  binary: "EXE",
+  other:  "?",
+};
 
 export interface ToolDef {
   label: string;

@@ -1,5 +1,5 @@
 import { FileItem, HistoryState, RenderNode } from "./types";
-import { TOOLS, COLORS, fileColor } from "./config";
+import { TOOLS, COLORS, fileColor, MAX_VISIBLE_ITEMS } from "./config";
 import { getParentPath } from "./utils";
 
 export function calculateLayout(
@@ -22,9 +22,10 @@ export function calculateLayout(
     ? selectedFile.name
     : (pathParts[pathParts.length - 1] || currentPath);
 
-  // Center node
+  // Center node — label may be updated below if items truncated
+  let centerLabel = selectedEditor ? selectedEditor.toUpperCase() : folderName;
   newVisible.push({
-    label:     selectedEditor ? selectedEditor.toUpperCase() : folderName,
+    label:     centerLabel,
     isDir:     !selectedFile,
     isAction:  false,
     isBack:    false,
@@ -37,7 +38,6 @@ export function calculateLayout(
   const isBrowsing = !selectedFile && !showFolderTools && !selectedEditor;
 
   if (isBrowsing) {
-    const dist = 200 * expansionPos;
     const hasParent = getParentPath(currentPath) !== null;
     const parentState = pathHistory[pathHistory.length - 1];
 
@@ -53,8 +53,17 @@ export function calculateLayout(
       angleToParent = Math.atan2(dy, dx);
     }
 
-    const maxItems = 12;
-    const itemsToDisplay = itemsList.slice(0, maxItems);
+    const itemsToDisplay = itemsList.slice(0, MAX_VISIBLE_ITEMS);
+    const itemCount = itemsToDisplay.length;
+
+    // Append (+N) to center label when items are truncated
+    if (itemsList.length > MAX_VISIBLE_ITEMS) {
+      newVisible[0].label = `${centerLabel} (+${itemsList.length - MAX_VISIBLE_ITEMS})`;
+    }
+
+    // Dynamic scaling for large directories
+    const scale = itemCount > 12 ? Math.max(0.6, 12 / itemCount) : 1;
+    const dist = (200 + Math.max(0, itemCount - 12) * 8) * expansionPos;
 
     let exitedItemIndex = -1;
     if (justExitedPath) {
@@ -80,13 +89,14 @@ export function calculateLayout(
         const angle = angleToParent + (2 * Math.PI * (i + 1)) / (N + 1);
         const normalX = originX + dist * Math.cos(angle);
         const normalY = originY + dist * Math.sin(angle);
+        const satRadius = item.is_dir ? Math.max(45 * scale, 28) : Math.max(35 * scale, 28);
 
         newVisible.push({
           label: item.name, isDir: item.is_dir, isAction: false, isBack: false,
           path: item.path,
           worldX: isExited && justExitedX != null ? justExitedX : normalX,
           worldY: isExited && justExitedY != null ? justExitedY : normalY,
-          radius: item.is_dir ? 45 : 35,
+          radius: satRadius,
           baseColor: isExited ? COLORS.exited : (item.is_dir ? COLORS.dir : fileColor(item.name))
         });
       });
@@ -95,9 +105,6 @@ export function calculateLayout(
       // ─── CASE 4: No parent (Root, e.g., D:/) ───
       const N = itemsToDisplay.length;
 
-      // Calculate a rotation offset so the entire wheel rotates seamlessly,
-      // placing the yellow exited node at the bottom, keeping perfect spacing
-      // with other nodes and preventing any overlaps.
       let rotationOffset = 0;
       if (exitedItemIndex !== -1 && justExitedX != null && justExitedY != null) {
         const targetAngle = Math.atan2(justExitedY - originY, justExitedX - originX);
@@ -110,14 +117,50 @@ export function calculateLayout(
         const angle = (2 * Math.PI * i) / N - Math.PI / 2 + rotationOffset;
         const normalX = originX + dist * Math.cos(angle);
         const normalY = originY + dist * Math.sin(angle);
+        const satRadius = item.is_dir ? Math.max(45 * scale, 28) : Math.max(35 * scale, 28);
 
         newVisible.push({
           label: item.name, isDir: item.is_dir, isAction: false, isBack: false,
           path: item.path,
           worldX: isExited && justExitedX != null ? justExitedX : normalX,
           worldY: isExited && justExitedY != null ? justExitedY : normalY,
-          radius: item.is_dir ? 45 : 35,
+          radius: satRadius,
           baseColor: isExited ? COLORS.exited : (item.is_dir ? COLORS.dir : fileColor(item.name))
+        });
+      });
+    }
+
+    // ⚙ Tools action node — always visible in browsing mode
+    newVisible.push({
+      label: "⚙ Tools",
+      isDir: false,
+      isAction: true,
+      actionId: "show_tools",
+      isBack: false,
+      worldX: originX + Math.min(dist, 200 * expansionPos) * Math.cos(Math.PI / 2),
+      worldY: originY + Math.min(dist, 200 * expansionPos) * Math.sin(Math.PI / 2),
+      radius: 25,
+      baseColor: COLORS.tools,
+    });
+
+    // Breadcrumb nodes for parent path segments
+    if (pathParts.length > 1) {
+      const crumbs = pathParts.slice(0, -1); // all but the current folder
+      const crumbsDist = 120 * expansionPos;
+      const startAngle = -Math.PI / 2 - ((crumbs.length - 1) * 0.2) / 2;
+      crumbs.forEach((part, i) => {
+        const crumbPath = pathParts.slice(0, i + 1).join("\\");
+        const angle = startAngle + i * 0.2;
+        newVisible.push({
+          label: part,
+          isDir: true,
+          isAction: false,
+          path: crumbPath,
+          isBack: false,
+          worldX: originX + crumbsDist * Math.cos(angle),
+          worldY: originY + crumbsDist * Math.sin(angle),
+          radius: 22,
+          baseColor: COLORS.back,
         });
       });
     }
